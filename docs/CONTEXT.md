@@ -56,6 +56,8 @@ and are responsible for every binary they place in it.
 
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
+The proposed filesystem-sweep design is documented in
+[plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
