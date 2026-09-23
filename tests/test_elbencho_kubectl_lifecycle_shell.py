@@ -329,9 +329,13 @@ def test_fake_kubectl_discovers_only_ready_nonterminating_workers(
     output = tmp_path / "workers.tsv"
     result = _bash(f"""
         kubectl_run_bounded() {{
-          printf 'node-a\\tpod-a\\tpoduid-a\\t10.0.0.1\\tTrue\\tsha256:one\\t\\n'
-          printf 'node-b\\tpod-old\\tpoduid-old\\t10.0.0.2\\tTrue\\tsha256:one\\t2026-01-01T00:00:00Z\\n'
-          printf 'node-b\\tpod-new\\tpoduid-new\\t10.0.0.3\\tTrue\\tsha256:one\\t\\n'
+          if [[ "$*" == *"get nodes"* ]]; then
+            printf 'node-a\\tuid-a\\tamd64\\tTrue\\t\\nnode-b\\tuid-b\\tamd64\\tTrue\\t\\n'
+          else
+            printf 'node-a\\tpod-a\\tpoduid-a\\t10.0.0.1\\tTrue\\tsha256:one\\t\\n'
+            printf 'node-b\\tpod-old\\tpoduid-old\\t10.0.0.2\\tTrue\\tsha256:one\\t2026-01-01T00:00:00Z\\n'
+            printf 'node-b\\tpod-new\\tpoduid-new\\t10.0.0.3\\tTrue\\tsha256:one\\t\\n'
+          fi
         }}
         kubectl_discover_worker_endpoints test-ns 1234abcd {str(nodes)!r} {str(output)!r}
         ! grep -F pod-old {str(output)!r}
@@ -344,9 +348,52 @@ def test_terminal_job_evidence_preserves_empty_active_field() -> None:
     """A failed Job with no active count reaches coordinator recovery."""
     result = _bash("""
         kubectl_verify_object_identity() { :; }
-        kubectl_run_bounded() { printf '|1|True'; }
+        kubectl_run_bounded() { printf '|0|1||True'; }
         kubectl_job_is_terminal_failure Job sweep test-ns \
           0123456789abcdef0123456789abcdef 1234abcd uid-1
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> None:
+    """A large archive never inherits the short status-command deadline."""
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        export KUBECTL_COLLECTION_TIMEOUT_SECONDS=123
+        kubectl_pvc_exec() {{
+          printf '%s\t%s\n' "$KUBECTL_REQUEST_TIMEOUT_SECONDS" \
+            "$KUBECTL_PROCESS_TIMEOUT_SECONDS"
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        test "$(cat {str(archive)!r})" = $'123\t183'
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_waits_for_exact_journaled_job_quiescence(
+    tmp_path: Path,
+) -> None:
+    """Terminal ledger state alone is not sufficient collection evidence."""
+    result = _bash(f"""
+        calls={str(tmp_path / 'calls')!r}
+        kubectl_attempt_load_resource() {{
+          KUBECTL_RESOURCE_KIND=Job
+          KUBECTL_RESOURCE_NAME=sweep
+          KUBECTL_RESOURCE_NAMESPACE=test-ns
+          KUBECTL_RESOURCE_NONCE=0123456789abcdef0123456789abcdef
+          KUBECTL_RESOURCE_UID=job-uid
+        }}
+        kubectl_attempt_step_done() {{ return 1; }}
+        kubectl_job_terminal_state() {{
+          printf x >> "$calls"
+          if [[ $(wc -c < "$calls") -eq 1 ]]; then
+            return 2
+          fi
+          printf -v "$1" '%s' COMPLETE
+        }}
+        sleep() {{ :; }}
+        kubectl_wait_journaled_job_quiescent {str(tmp_path)!r} 1234abcd 2
+        test "$(cat "$calls")" = xx
         """)
     assert result.returncode == 0, result.stderr
 
@@ -367,7 +414,13 @@ def test_fake_kubectl_rejects_malformed_worker_endpoint_fields(
     nodes.write_text("node-a\\tuid-a\\tamd64\\n", encoding="utf-8")
     output = tmp_path / "workers.tsv"
     result = _bash(f"""
-        kubectl_run_bounded() {{ printf %s {malformed!r}; }}
+        kubectl_run_bounded() {{
+          if [[ "$*" == *"get nodes"* ]]; then
+            printf 'node-a\\tuid-a\\tamd64\\tTrue\\t\\n'
+          else
+            printf %s {malformed!r}
+          fi
+        }}
         ! kubectl_discover_worker_endpoints test-ns 1234abcd \\
             {str(nodes)!r} {str(output)!r}
         """)
@@ -404,7 +457,11 @@ def test_worker_endpoint_comparison_reports_replacement_and_ip_drift(
     result = _bash(f"""
         export KUBECTL_REQUEST_TIMEOUT_SECONDS=2 KUBECTL_PROCESS_TIMEOUT_SECONDS=5
         kubectl_run_bounded() {{
-            printf %b {rows!r}
+            if [[ "$*" == *"get nodes"* ]]; then
+                printf 'node-a\\tuid-node\\tamd64\\tTrue\\t\\n'
+            else
+                printf %b {rows!r}
+            fi
         }}
         kubectl_compare_worker_endpoints test-ns 1234abcd {str(nodes)!r} \\
             {str(frozen)!r} {str(report)!r}
@@ -429,7 +486,9 @@ def test_worker_endpoint_comparison_refreshes_existing_evidence(tmp_path: Path) 
     invocation = tmp_path / "invocation"
     result = _bash(f"""
         kubectl_run_bounded() {{
-            if [[ -e {str(invocation)!r} ]]; then
+            if [[ "$*" == *"get nodes"* ]]; then
+                printf 'node-a\\tuid-node\\tamd64\\tTrue\\t\\n'
+            elif [[ -e {str(invocation)!r} ]]; then
                 printf 'node-a\\tpod-new\\tuid-new\\t10.0.0.9\\tTrue\\tsha256:one\\t\\n'
             else
                 : > {str(invocation)!r}
@@ -442,6 +501,42 @@ def test_worker_endpoint_comparison_refreshes_existing_evidence(tmp_path: Path) 
             {str(frozen)!r} {str(report)!r} || rc=$?
         test "${{rc:-0}}" -eq 2
         grep -F $'\\tIP_DRIFT' {str(report)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("node_row", "pod_image", "expected_status"),
+    (
+        ("node-a\tuid-recreated\tamd64\tTrue\t\n", "sha256:one", "NODE_DRIFT"),
+        ("node-a\tuid-node\tarm64\tTrue\t\n", "sha256:one", "ARCH_DRIFT"),
+        ("node-a\tuid-node\tamd64\tTrue\t\n", "sha256:two", "IMAGE_DRIFT"),
+    ),
+)
+def test_worker_endpoint_comparison_checks_all_frozen_identity_fields(
+    tmp_path: Path, node_row: str, pod_image: str, expected_status: str
+) -> None:
+    """Node recreation, architecture, and image drift all fail closed."""
+    nodes = tmp_path / "nodes.tsv"
+    nodes.write_text("node-a\tuid-node\tamd64\n", encoding="utf-8")
+    frozen = tmp_path / "frozen.tsv"
+    frozen.write_text(
+        "node-a\tuid-node\tpod-a\tpod-uid\t10.0.0.1\tamd64\tsha256:one\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "endpoint-drift.tsv"
+    result = _bash(f"""
+        kubectl_run_bounded() {{
+          if [[ "$*" == *"get nodes"* ]]; then
+            printf %b {node_row!r}
+          else
+            printf 'node-a\\tpod-a\\tpod-uid\\t10.0.0.1\\tTrue\\t{pod_image}\\t\\n'
+          fi
+        }}
+        kubectl_compare_worker_endpoints test-ns 1234abcd {str(nodes)!r} \
+          {str(frozen)!r} {str(report)!r} || rc=$?
+        test "${{rc:-0}}" -eq 2
+        grep -F $'\\t{expected_status}' {str(report)!r}
         """)
     assert result.returncode == 0, result.stderr
 
@@ -462,7 +557,13 @@ def test_worker_discovery_rejects_each_malformed_endpoint_field(
     nodes.write_text("node-a\tuid-a\tamd64\n", encoding="utf-8")
     output = tmp_path / "workers.tsv"
     result = _bash(f"""
-        kubectl_run_bounded() {{ printf '{row}\\n'; }}
+        kubectl_run_bounded() {{
+          if [[ "$*" == *"get nodes"* ]]; then
+            printf 'node-a\\tuid-a\\tamd64\\tTrue\\t\\n'
+          else
+            printf '{row}\\n'
+          fi
+        }}
         ! kubectl_discover_worker_endpoints test-ns 1234abcd \
           {str(nodes)!r} {str(output)!r}
         """)
@@ -763,6 +864,60 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
         [[ $(cat "$events") == nodeshelperpathsjournalreserveacquiredinitializepolicyworkersendpoints ]]
         """)
     assert result.returncode == 0, result.stderr
+
+
+def test_stale_resume_contender_cannot_replace_successful_attempt(
+    tmp_path: Path,
+) -> None:
+    """Resume publication is a compare-and-swap against the collected attempt."""
+    state = tmp_path / "results" / "kubernetes"
+    results = tmp_path / "results"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
+        kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
+        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\tpv-uid\tpvc-uid\n'; }}
+        kubectl_attempt_write_configuration() {{ : > "$1/attempts/$3/configuration.sh"; }}
+        kubectl_discover_candidate_nodes() {{ printf 'node-a\tuid-a\tamd64\n' > "$2"; }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_attempt_journal_resource() {{ :; }}
+        kubectl_validate_pvc_paths() {{ :; }}
+        kubectl_attempt_journal_remote_reservation() {{ :; }}
+        kubectl_reserve_remote_attempt() {{ :; }}
+        kubectl_attempt_mark_remote_reservation_acquired() {{ :; }}
+        kubectl_initialize_remote_control_tree() {{ :; }}
+        kubectl_create_attempt_policies() {{ :; }}
+        kubectl_create_worker_daemonset() {{ :; }}
+        kubectl_wait_worker_endpoints() {{ : > "$4"; }}
+        first=
+        kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped '' 1234abcd
+        test "$first" = aaaabbbb
+        second=
+        ! kubectl_prepare_attempt_lifecycle second {str(results)!r} 1 mapped '' 1234abcd
+        test "$(kubectl_attempt_current_id "$root")" = aaaabbbb
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_submission_prints_status_cancel_and_collect_commands(tmp_path: Path) -> None:
+    """Every asynchronous control operation is copy-pasteable after submit."""
+    results = tmp_path / "results with spaces"
+    results.mkdir()
+    result = _bash(f"kubectl_emit_lifecycle_commands {str(results)!r}")
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_STATUS_COMMAND=" in result.stdout
+    assert "STORAGE_SCALE_TEST_CANCEL_COMMAND=" in result.stdout
+    assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
 
 
 def test_prepared_attempt_recovery_releases_intended_reservation(

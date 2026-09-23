@@ -209,12 +209,13 @@ directory.
 
 A Kubernetes invocation submits one asynchronous Job for the whole sweep.
 Submission stages the verified control bundle and execution definitions on
-the PVC, starts the Job, and prints commands for querying and collecting the
-attempt:
+the PVC, starts the Job, and prints commands for querying, cancelling, and
+collecting the attempt:
 
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR"/elbencho-<datestamp>/
+./storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR"/elbencho-<datestamp>/
 ./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR"/elbencho-<datestamp>/
 ```
 

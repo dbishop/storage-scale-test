@@ -3266,6 +3266,9 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
     assert worker["ports"] == [
         {"name": "status", "containerPort": 1611, "protocol": "TCP"}
     ]
+    readiness_script = worker["readinessProbe"]["exec"]["command"][-1]
+    assert "read -r -t 2 response" in readiness_script
+    assert "cat <&3" not in readiness_script
     assert daemonset["spec"]["template"]["spec"]["volumes"] == [
         {
             "name": "storage",

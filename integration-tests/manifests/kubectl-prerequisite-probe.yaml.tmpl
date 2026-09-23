@@ -69,9 +69,11 @@ spec:
                 - /bin/bash
                 - -ceu
                 - |
-                  response=$(exec 3<>/dev/tcp/127.0.0.1/1611; printf 'GET /status HTTP/1.0\r\nHost: 127.0.0.1:1611\r\n\r\n' >&3; cat <&3)
+                  exec 3<>/dev/tcp/127.0.0.1/1611
+                  printf 'GET /status HTTP/1.0\r\nHost: 127.0.0.1:1611\r\n\r\n' >&3
+                  IFS= read -r -t 2 response <&3
                   exec 3>&-
-                  [[ "$response" == *"200"* ]]
+                  [[ "$response" == *" 200 "* ]]
             initialDelaySeconds: 1
             periodSeconds: 1
             timeoutSeconds: 3

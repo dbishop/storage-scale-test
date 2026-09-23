@@ -191,13 +191,49 @@ _coordinator_validate_arguments() {
     fi
 }
 
-_coordinator_initialize_state() {
+_coordinator_validate_state_tree() {
     if [[ -e "$STATE_DIR" ]] \
             && find -P "$STATE_DIR" -type l -print -quit | grep -q .; then
         _coordinator_error "attempt state contains a symlink"
         return 1
     fi
     mkdir -p "$STATE_DIR/executions" "$STATE_DIR/results" || return 1
+}
+
+_coordinator_initialize_snapshots() {
+    local allow_create="${1:-1}" snapshot
+    [[ "$allow_create" =~ ^[01]$ ]] || return 1
+    for snapshot in env_used.sh env_used.yaml; do
+        if [[ ! -e "$STATE_DIR/$snapshot" ]]; then
+            [[ "$allow_create" -eq 1 ]] || return 1
+            cp -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot" || return 1
+        elif [[ ! -f "$STATE_DIR/$snapshot" || -L "$STATE_DIR/$snapshot" ]] \
+                || ! cmp -s -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot"; then
+            _coordinator_error "existing working snapshot differs: $snapshot"
+            return 1
+        fi
+    done
+}
+
+_coordinator_initialize_execution_states() {
+    local allow_create="${1:-1}" definition id state_file
+    [[ "$allow_create" =~ ^[01]$ ]] || return 1
+    for definition in "$CONTROL_DIR"/executions/[0-9][0-9][0-9][0-9].sh; do
+        [[ -f "$definition" ]] || continue
+        id=$(basename "$definition" .sh)
+        state_file="$STATE_DIR/executions/$id.status"
+        if [[ ! -e "$state_file" ]]; then
+            [[ "$allow_create" -eq 1 ]] || return 1
+            _coordinator_atomic_write "$state_file" PENDING || return 1
+        elif [[ ! -f "$state_file" || -L "$state_file" ]]; then
+            _coordinator_error "execution state is not a regular file: $id"
+            return 1
+        fi
+    done
+}
+
+_coordinator_initialize_state() {
+    _coordinator_validate_state_tree || return 1
     [[ ! -e "$STATE_DIR/coordinator.lock" ]] || {
         _coordinator_error "another coordinator owns this attempt"
         return 1
@@ -212,28 +248,11 @@ _coordinator_initialize_state() {
         printf 'pid\t%s\n' "${BASHPID:-$$}"
         printf 'started_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$STATE_DIR/coordinator.lock/owner.tsv" || return 1
-    local snapshot
-    for snapshot in env_used.sh env_used.yaml; do
-        if [[ ! -e "$STATE_DIR/$snapshot" ]]; then
-            cp -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot" || return 1
-        elif [[ ! -f "$STATE_DIR/$snapshot" || -L "$STATE_DIR/$snapshot" ]] \
-                || ! cmp -s -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot"; then
-            _coordinator_error "existing working snapshot differs: $snapshot"
-            return 1
-        fi
-    done
-    local definition id state_file
-    for definition in "$CONTROL_DIR"/executions/[0-9][0-9][0-9][0-9].sh; do
-        [[ -f "$definition" ]] || continue
-        id=$(basename "$definition" .sh)
-        state_file="$STATE_DIR/executions/$id.status"
-        if [[ ! -e "$state_file" ]]; then
-            _coordinator_atomic_write "$state_file" PENDING || return 1
-        elif [[ ! -f "$state_file" || -L "$state_file" ]]; then
-            _coordinator_error "execution state is not a regular file: $id"
-            return 1
-        fi
-    done
+    _coordinator_integration_crash_after after-lock
+    _coordinator_initialize_snapshots || return 1
+    _coordinator_integration_crash_after after-snapshots
+    _coordinator_initialize_execution_states || return 1
+    _coordinator_integration_crash_after after-execution-state
 }
 
 _coordinator_valid_ipv4() {
@@ -578,7 +597,7 @@ _coordinator_check_integration_overlay() {
         return 1
     fi
     if [[ -n "${KUBECTL_INTEGRATION_CRASH_AFTER:-}" \
-            && ! "${KUBECTL_INTEGRATION_CRASH_AFTER}" =~ ^(after-run-status|after-running|after-copy|after-terminal|after-manifest)$ ]]; then
+            && ! "${KUBECTL_INTEGRATION_CRASH_AFTER}" =~ ^(after-lock|after-snapshots|after-execution-state|after-run-status|after-running|after-copy|after-terminal|after-manifest)$ ]]; then
         _coordinator_error "unknown integration crash boundary"
         return 1
     fi
@@ -690,6 +709,10 @@ _coordinator_run_one() {
             _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
             return 1
         }
+        _coordinator_validate_pvc_path "$ELBENCHO_RUN_GENERATED_TEST_ROOT" || {
+            _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+            return 1
+        }
     fi
     export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV ELBENCHO_RUN_GENERATED_TEST_ROOT
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
@@ -699,6 +722,15 @@ _coordinator_run_one() {
         }
         ELBENCHO_SWEEP_READ_FROM="$mapped_read_from"
         export ELBENCHO_SWEEP_READ_FROM
+        # The many-file tree cache creates a staging file in the dataset's
+        # parent before publishing beneath the dataset. Validate both derived
+        # locations against live PVC symlinks immediately before workload IO.
+        if ! _coordinator_validate_pvc_path "$ELBENCHO_SWEEP_READ_FROM" \
+                || ! _coordinator_validate_pvc_path \
+                    "$(dirname "$ELBENCHO_SWEEP_READ_FROM")"; then
+            _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+            return 1
+        fi
     fi
     if [[ "$nodes" -eq 1 ]]; then
         elbencho_set_cell_run_context "$id" "$nodes" '' "$test_dirs_csv" \
@@ -734,9 +766,26 @@ kubectl_map_generated_csv() {
     IFS=, read -ra _coordinator_generated_paths <<< "$csv"
     for item in "${_coordinator_generated_paths[@]}"; do
         mapped=$(kubectl_map_logical_path "$item") || return 1
+        _coordinator_validate_pvc_path "$mapped" || return 1
         output+=("$mapped")
     done
     IFS=, printf '%s' "${output[*]}"
+}
+
+_coordinator_validate_pvc_path() {
+    local candidate="$1" root_real resolved
+    [[ ( "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT" \
+            || "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ) \
+        && "$candidate" != *$'\n'* && "$candidate" != *$'\r'* \
+        && "$candidate" != *$'\t'* ]] || return 1
+    root_real=$(realpath -e -- "$KUBECTL_SWEEP_MOUNT_ROOT") || return 1
+    resolved=$(realpath -m -- "$candidate") || return 1
+    [[ ( "$resolved" == "$root_real" || "$resolved" == "$root_real/"* ) \
+        && "$resolved" != "$root_real/$KUBECTL_SWEEP_RESERVED_ROOT" \
+        && "$resolved" != "$root_real/$KUBECTL_SWEEP_RESERVED_ROOT/"* ]] || {
+            _coordinator_error "workload path escapes the mounted PVC: $candidate"
+            return 1
+        }
 }
 
 _coordinator_finalize_run() {
@@ -762,10 +811,17 @@ _coordinator_recover_lost() {
         _coordinator_error "lost-coordinator recovery requires the durable coordinator lock"
         return 1
     }
-    [[ "$(cat "$STATE_DIR/run.status" 2>/dev/null || true)" == RUNNING ]] || {
-        _coordinator_error "lost-coordinator recovery requires a RUNNING attempt"
+    _coordinator_validate_state_tree || return 1
+    local observed_run_status
+    observed_run_status=$(cat "$STATE_DIR/run.status" 2>/dev/null || true)
+    [[ "$observed_run_status" =~ ^(PREPARED|RUNNING)$ ]] || {
+        _coordinator_error "lost-coordinator recovery requires a PREPARED or RUNNING attempt"
         return 1
     }
+    local allow_startup_repair=0
+    [[ "$observed_run_status" == PREPARED ]] && allow_startup_repair=1
+    _coordinator_initialize_snapshots "$allow_startup_repair" || return 1
+    _coordinator_initialize_execution_states "$allow_startup_repair" || return 1
     local status_file id status failed_id="" first_pending="" changed=0
     local execution_observed_status=""
     for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
@@ -800,7 +856,7 @@ _coordinator_recover_lost() {
         printf 'schema\t1\n'
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
         printf 'execution\t%s\n' "$failed_id"
-        printf 'observed_status\tRUNNING\n'
+        printf 'observed_status\t%s\n' "$observed_run_status"
         printf 'execution_observed_status\t%s\n' "$execution_observed_status"
         printf 'recovered_status\tFAILED\n'
         printf 'exit_code\t143\n'

@@ -3631,9 +3631,10 @@ def _kubectl_probe_status(
     """Query one Elbencho service directly by numeric Pod IPv4 address."""
     ipaddress.IPv4Address(address)
     script = (
-        'response=$(exec 3<>/dev/tcp/"$1"/1611; '
+        'exec 3<>/dev/tcp/"$1"/1611; '
         "printf 'GET /status HTTP/1.0\\r\\nHost: %s:1611\\r\\n\\r\\n' "
-        '"$1" >&3; cat <&3); exec 3>&-; [[ "$response" == *"200"* ]]'
+        '"$1" >&3; IFS= read -r -t 5 response <&3; exec 3>&-; '
+        '[[ "$response" == *" 200 "* ]]'
     )
     return _kubectl_probe_exec(
         runner,
