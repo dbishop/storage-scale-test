@@ -135,6 +135,7 @@ _require_pods = getattr(_FILESYSTEM, "_require_pods")
 _kubectl_output_value = getattr(_FILESYSTEM, "_kubectl_output_value")
 _kubectl_submission = getattr(_FILESYSTEM, "_kubectl_submission")
 _kubectl_lifecycle_state = getattr(_FILESYSTEM, "_kubectl_lifecycle_state")
+_create_generated_inputs = getattr(_FILESYSTEM, "_create_generated_inputs")
 _kubectl_utility_manifest = getattr(_FILESYSTEM, "_kubectl_utility_manifest")
 _override_block = getattr(_FILESYSTEM, "_override_block")
 _require_kubectl_nodes = getattr(_FILESYSTEM, "_require_kubectl_nodes")
@@ -387,6 +388,54 @@ def test_kubectl_status_poll_retries_transient_command_failure(tmp_path, monkeyp
     )
     assert state == "SUCCESS"
     assert calls == 2
+
+
+def test_kubectl_command_accepts_only_declared_terminal_failure(tmp_path):
+    """Failed collect is accepted only with its machine-readable state."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=1,
+                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stderr="",
+            )
+
+    output = _run_kubectl_command(
+        _Runner(),
+        config,
+        runtime,
+        "collect",
+        ("--collect", "/tmp/results"),
+        logs,
+        30,
+        accepted_states=frozenset({"FAILED"}),
+    )
+    assert _kubectl_lifecycle_state(output) == "FAILED"
+
+
+def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatch):
+    """Generated input paths use logical roots only after PVC mapping."""
+    commands = []
+    monkeypatch.setattr(
+        _FILESYSTEM,
+        "_storage_utility_shell",
+        lambda _runner, _config, _fixture, command, **_kwargs: commands.append(command),
+    )
+    generated = SimpleNamespace(relative_path="staged/input", size_bytes=4096)
+    step = SimpleNamespace(generated_inputs=(generated,))
+    runtime = SimpleNamespace(
+        selector="kubectl", values={"test_root": "integration-regression/run/primary"}
+    )
+    fixture = SimpleNamespace(login_pod=None, login_container=None)
+    _create_generated_inputs(object(), object(), fixture, runtime, step)
+    assert "/mnt/storage-scale-test/integration-regression/run/primary" in commands[0]
 
 
 def test_kubectl_cleanup_reports_lifecycle_failure(tmp_path):

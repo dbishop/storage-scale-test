@@ -104,6 +104,18 @@ KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
     {"PREPARED", "SUBMITTED", "RUNNING"}
 )
+KUBECTL_SUPPORTED_SCENARIOS = frozenset(
+    {
+        "baseline",
+        "default-dio",
+        "failure-resume",
+        "live-capture",
+        "kubectl-retained-read",
+        "kubectl-cancel",
+        "kubectl-coordinator-loss",
+        "kubectl-endpoint-drift",
+    }
+)
 VALIDATION_SUCCESS = "All validation checks passed successfully"
 WORKLOAD_USER = "tester"
 WORKLOAD_UID = 2000
@@ -1656,6 +1668,60 @@ def _sync_step_runtime(
 ) -> None:
     """Render and install one step's env and support files."""
     extra_env = step.render_env(runtime.values)
+    if runtime.selector == "kubectl" and runtime.scenario.name == "failure-resume":
+        # The product copies this integration-only executable into the control
+        # bundle before creating the Job.  It fails exactly one reified cell;
+        # the resume operation deliberately unsets the hook while selecting
+        # only unfinished cells.
+        target_ids = [
+            execution_id
+            for execution_id, execution in enumerate(step.executions)
+            if execution.status is ExecutionStatus.FAILED
+        ]
+        if target_ids:
+            target_id = f"{target_ids[0] + 1:04d}"
+            overlay = Path(runtime.workspace) / "kubectl-failure-overlay.sh"
+            overlay.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"if [[ ${{1:-}} == {target_id!r} "
+                "&& ${4:-} == after-benchmark ]]; then\n"
+                '  marker="$3/.integration-failure-injected"\n'
+                '  if mkdir -- "$marker" 2>/dev/null; then\n'
+                "    exit 97\n"
+                "  fi\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            overlay.chmod(0o700)
+            extra_env += (
+                "\nexport STORAGE_SCALE_TEST_INTEGRATION=1\n"
+                "export KUBECTL_INTEGRATION_FAILURE_OVERLAY="
+                f"{_shell(overlay)}\n"
+            )
+    elif runtime.selector == "kubectl" and runtime.scenario.name in {
+        "kubectl-cancel",
+        "kubectl-coordinator-loss",
+        "kubectl-endpoint-drift",
+    }:
+        # Hold the first cell at a deterministic RUNNING boundary. This avoids
+        # racing a tiny benchmark while still exercising the real Job,
+        # DaemonSet, PVC, and product lifecycle around the mutation.
+        overlay = Path(runtime.workspace) / "kubectl-running-overlay.sh"
+        overlay.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "[[ ${4:-} == before-benchmark ]] || exit 0\n"
+            "trap 'exit 143' INT TERM\n"
+            "sleep 90\n",
+            encoding="utf-8",
+        )
+        overlay.chmod(0o700)
+        extra_env += (
+            "\nexport STORAGE_SCALE_TEST_INTEGRATION=1\n"
+            "export KUBECTL_INTEGRATION_FAILURE_OVERLAY="
+            f"{_shell(overlay)}\n"
+        )
     extra_support = {
         item.relative_path: item.content
         for item in step.render_support_files(runtime.values)
@@ -1738,12 +1804,15 @@ def _create_generated_inputs(
     """Create bounded scenario inputs through the shared PVC mount."""
     for generated in step.generated_inputs:
         path = f"{runtime.values['test_root']}/{generated.relative_path}"
+        storage_path = (
+            f"{KUBECTL_STORAGE_MOUNT}/{path}" if runtime.selector == "kubectl" else path
+        )
         command = f"""
 set -euo pipefail
 umask 0007
-mkdir -p -- {_shell(str(PurePosixPath(path).parent))}
-truncate -s {generated.size_bytes} -- {_shell(path)}
-test "$(stat -c %s -- {_shell(path)})" -eq {generated.size_bytes}
+mkdir -p -- {_shell(str(PurePosixPath(storage_path).parent))}
+truncate -s {generated.size_bytes} -- {_shell(storage_path)}
+test "$(stat -c %s -- {_shell(storage_path)})" -eq {generated.size_bytes}
 """.strip()
         _storage_shell(runner, config, fixture, command)
 
@@ -1858,7 +1927,10 @@ def _expected_dataset_totals(
         return nodes * 2, nodes * (MAX_LIVE_CAPTURE_DATASET_BYTES // 2)
     if scenario == "slurm-cartesian":
         return nodes * 2, nodes * 2 * 1024 * 1024
-    if scenario == "retained-lifecycle" and step.kind is not CommandKind.DELETE:
+    if (
+        scenario in {"retained-lifecycle", "kubectl-retained-read"}
+        and step.kind is not CommandKind.DELETE
+    ):
         return 1, 16 * 1024 * 1024
     return None
 
@@ -1940,8 +2012,11 @@ def _assert_execution_contract(
             "ssh-single-big-file",
             "ssh-weighted-roots",
         } and not (
-            scenario.name == "retained-lifecycle"
-            and step.name.startswith("read-cache-")
+            (
+                scenario.name == "retained-lifecycle"
+                and step.name.startswith("read-cache-")
+            )
+            or (scenario.name == "kubectl-retained-read" and step.name == "read-from")
         ):
             _assert_phase_artifacts(execution_root, execution_id, step, expected.status)
         workload_path = execution_root / f"{execution_id}.workload.tsv"
@@ -1963,8 +2038,11 @@ def _assert_execution_contract(
                     f"dataset totals in {workload_path}"
                 )
             valid_completion = {"completed"}
-            if scenario.name == "retained-lifecycle" and step.name.startswith(
-                "read-cache-"
+            if (
+                scenario.name == "retained-lifecycle"
+                and step.name.startswith("read-cache-")
+            ) or (
+                scenario.name == "kubectl-retained-read" and step.name == "read-from"
             ):
                 valid_completion.add("not_applicable_time_based")
             if (
@@ -1995,18 +2073,37 @@ def _assert_dataset_state(
     step: ScenarioStep,
     result: Path | None,
     retained_path: str | None,
+    storage_prefix: str = "",
 ) -> None:
     """Validate cleanup or retention only within scenario-owned paths."""
+
+    def storage_path(path: str) -> str:
+        if storage_prefix and not PurePosixPath(path).is_absolute():
+            return f"{storage_prefix}/{path}"
+        return path
+
     if step.dataset is DatasetExpectation.PRESERVED:
         if retained_path:
-            _storage_shell(runner, config, fixture, f"test -e {_shell(retained_path)}")
+            retained_storage_path = storage_path(retained_path)
+            retained_parent = str(PurePosixPath(retained_storage_path).parent)
+            _storage_shell(
+                runner,
+                config,
+                fixture,
+                "for _ in $(seq 1 30); do "
+                f"test -e {_shell(retained_storage_path)} && exit 0; sleep 1; done; "
+                "{ "
+                f"echo 'missing retained dataset: ' {_shell(retained_storage_path)} >&2; "
+                f"find {_shell(retained_parent)} -maxdepth 2 -printf '%y %p %s\\n' "
+                "2>&1 >&2 || true; exit 1; }",
+            )
         return
     paths = list(_execution_targets(result)) if result is not None else []
     if step.dataset is DatasetExpectation.REMOVED and retained_path:
         paths.append(retained_path)
     if not paths:
         return
-    probes = "\n".join(f"test ! -e {_shell(path)}" for path in paths)
+    probes = "\n".join(f"test ! -e {_shell(storage_path(path))}" for path in paths)
     _storage_shell(runner, config, fixture, f"set -euo pipefail\n{probes}")
 
 
@@ -2212,6 +2309,23 @@ def _retained_path(result: Path) -> str:
             f"expected one retained generated target, found {targets!r}"
         )
     return targets[0]
+
+
+def _kubectl_logical_path(path: str) -> str:
+    """Convert a collected container path back to the public logical path."""
+    prefix = f"{KUBECTL_STORAGE_MOUNT}/"
+    if path.startswith(prefix):
+        return path.removeprefix(prefix)
+    logical = PurePosixPath(path)
+    if (
+        logical.is_absolute()
+        or not path
+        or any(part in {"", ".", ".."} for part in logical.parts)
+    ):
+        raise IntegrationTestError(
+            f"Kubernetes retained path is not on the PVC: {path}"
+        )
+    return path
 
 
 def _assert_read_cache(step: ScenarioStep, result: Path) -> None:
@@ -2513,6 +2627,7 @@ def _run_kubectl_command(
     timeout: int,
     *,
     expected_failure: bool = False,
+    accepted_states: frozenset[str] = frozenset(),
 ) -> str:
     """Run one local kubectl-sweep command with the fixture kubeconfig."""
     command: list[str | Path] = [
@@ -2540,6 +2655,12 @@ def _run_kubectl_command(
             f"kubectl {name} unexpectedly succeeded; full output: {log_path}"
         )
     if result.returncode and not expected_failure:
+        if accepted_states:
+            try:
+                if _kubectl_lifecycle_state(output) in accepted_states:
+                    return output
+            except IntegrationTestError:
+                pass
         raise IntegrationTestError(
             f"kubectl {name} failed with exit code {result.returncode}; full "
             f"output: {log_path}\n{output.strip()[-8000:]}"
@@ -2601,7 +2722,7 @@ def _wait_for_kubectl_terminal_state(
                 "status",
                 ("--status", str(result_root)),
                 log_dir,
-                min(30, remaining),
+                min(120, remaining),
             )
         except IntegrationTestError as error:
             last_command_error = error
@@ -2720,8 +2841,617 @@ def _run_kubectl_baseline(
     _assert_execution_contract(runtime.scenario, step, result)
     _assert_semantic_flags(runtime.scenario.name, step, result)
     _assert_kubectl_ordered_workers(fixture, result)
-    _assert_dataset_state(runner, config, fixture, step, result, None)
+    _assert_dataset_state(
+        runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
+    )
     _assert_scenario_report(runner, report_workspace, result, runtime, step, log_dir)
+
+
+def _kubectl_collect_result(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    result_root: Path,
+    log_dir: Path,
+    *,
+    terminal_states: frozenset[str] = frozenset(),
+) -> Path:
+    """Collect one terminal attempt and return its published result tree."""
+    _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "collect",
+        ("--collect", str(result_root)),
+        log_dir,
+        180,
+        accepted_states=terminal_states,
+    )
+    return _collected_result_root(result_root)
+
+
+def _kubectl_run_step(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> Path | None:
+    """Run one ordinary Kubernetes step through submit/status/collect."""
+    if step.kind is CommandKind.DELETE:
+        raise IntegrationTestError(
+            f"Kubernetes adapter does not execute delete-only step {step.name}"
+        )
+    result_base = str(Path(runtime.workspace) / "results" / step.name)
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(runner, config, fixture, runtime, step, template, result_base)
+    _create_generated_inputs(runner, config, fixture, runtime, step)
+    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        step.name,
+        step.render_arguments(runtime.values),
+        log_dir,
+        step.timeout_seconds,
+    )
+    result_root, attempt_id = _kubectl_submission(output)
+    runtime.values["kubectl_result_root"] = str(result_root)
+    LOG.info("Submitted Kubernetes %s attempt %s", step.name, attempt_id)
+    terminal = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, result_root, log_dir, step.timeout_seconds
+    )
+    if terminal != "SUCCESS":
+        raise IntegrationTestError(f"kubectl {step.name} ended in {terminal}")
+    result = _kubectl_collect_result(runner, config, runtime, result_root, log_dir)
+    runtime.values["kubectl_collected"] = "1"
+    _assert_execution_contract(runtime.scenario, step, result)
+    _assert_semantic_flags(runtime.scenario.name, step, result)
+    _assert_dataset_state(
+        runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
+    )
+    _assert_step_specials(runner, config, fixture, runtime, step, result)
+    if {item.coordinate.nodes for item in step.executions} == {1, 2}:
+        _assert_kubectl_ordered_workers(fixture, result)
+    if "retained_data_dir" in step.exports:
+        retained = _retained_path(result)
+        runtime.values["retained_data_dir"] = _kubectl_logical_path(retained)
+        _assert_dataset_state(
+            runner,
+            config,
+            fixture,
+            step,
+            result,
+            runtime.values["retained_data_dir"],
+            KUBECTL_STORAGE_MOUNT,
+        )
+    _assert_scenario_report(runner, report_workspace, result, runtime, step, log_dir)
+    return result
+
+
+def _run_kubectl_success_scenario(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Run successful Kubernetes steps while retaining shared assertions."""
+    for step in runtime.scenario.steps:
+        _kubectl_run_step(
+            runner,
+            config,
+            fixture,
+            runtime,
+            step,
+            template,
+            report_workspace,
+            log_dir,
+        )
+
+
+def _kubectl_wait_for_state(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    result_root: Path,
+    log_dir: Path,
+    expected: frozenset[str],
+    timeout: int,
+) -> str:
+    """Poll status until one of the requested stable states is observed."""
+    deadline = time.monotonic() + timeout
+    observed = ""
+    last_command_error: IntegrationTestError | None = None
+    while time.monotonic() < deadline:
+        remaining = max(1, int(deadline - time.monotonic()))
+        try:
+            output = _run_kubectl_command(
+                runner,
+                config,
+                runtime,
+                "status",
+                ("--status", str(result_root)),
+                log_dir,
+                min(120, remaining),
+            )
+            observed = _kubectl_lifecycle_state(output)
+            if observed in expected:
+                return observed
+            if observed in KUBECTL_TERMINAL_STATES:
+                raise IntegrationTestError(
+                    f"kubectl attempt reached unexpected terminal state {observed}"
+                )
+        except IntegrationTestError as error:
+            last_command_error = error
+            if observed in KUBECTL_TERMINAL_STATES:
+                raise
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    detail = f"; last status error: {last_command_error}" if last_command_error else ""
+    raise IntegrationTestError(
+        f"kubectl attempt at {result_root} did not reach {sorted(expected)}{detail}"
+    )
+
+
+def _run_kubectl_failure_resume(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Collect a failed attempt, then resume it with a new attempt identity."""
+    first, resume = runtime.scenario.steps
+    result_base = str(Path(runtime.workspace) / "results" / first.name)
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(runner, config, fixture, runtime, first, template, result_base)
+    _create_generated_inputs(runner, config, fixture, runtime, first)
+    _validate_step_environment(runner, config, fixture, runtime, first, log_dir)
+    submission = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        first.name,
+        first.render_arguments(runtime.values),
+        log_dir,
+        first.timeout_seconds,
+    )
+    result_root, first_attempt = _kubectl_submission(submission)
+    runtime.values["kubectl_result_root"] = str(result_root)
+    terminal = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, result_root, log_dir, first.timeout_seconds
+    )
+    failed_result = _kubectl_collect_result(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        terminal_states=(
+            frozenset({"FAILED", "CANCELLED"}) if terminal != "SUCCESS" else frozenset()
+        ),
+    )
+    runtime.values["failed_results_dir"] = str(result_root)
+    runtime.values["kubectl_collected"] = "1"
+    if terminal not in {"FAILED", "CANCELLED"}:
+        raise IntegrationTestError(
+            f"failure-resume first attempt unexpectedly ended in {terminal}"
+        )
+    _assert_execution_contract(runtime.scenario, first, failed_result)
+    preserved = _hash_execution_contract(failed_result, "0001")
+    _assert_dataset_state(
+        runner, config, fixture, first, failed_result, None, KUBECTL_STORAGE_MOUNT
+    )
+
+    # The first attempt is collected, but the resumed attempt is active again;
+    # scenario cleanup must therefore remain armed for the new attempt.
+    runtime.values["kubectl_collected"] = "0"
+    resume_output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        resume.name,
+        resume.render_arguments(runtime.values),
+        log_dir,
+        resume.timeout_seconds,
+    )
+    resumed_root, second_attempt = _kubectl_submission(resume_output)
+    if second_attempt == first_attempt:
+        raise IntegrationTestError("kubectl resume reused the failed attempt ID")
+    runtime.values["kubectl_result_root"] = str(resumed_root)
+    terminal = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, resumed_root, log_dir, resume.timeout_seconds
+    )
+    if terminal != "SUCCESS":
+        raise IntegrationTestError(f"kubectl resume ended in {terminal}")
+    resumed_result = _kubectl_collect_result(
+        runner, config, runtime, resumed_root, log_dir
+    )
+    runtime.values["kubectl_collected"] = "1"
+    _assert_execution_contract(runtime.scenario, resume, resumed_result)
+    if _hash_execution_contract(resumed_result, "0001") != preserved:
+        raise IntegrationTestError("kubectl resume replaced successful execution 0001")
+    _assert_dataset_state(
+        runner, config, fixture, resume, resumed_result, None, KUBECTL_STORAGE_MOUNT
+    )
+    _assert_scenario_report(
+        runner, report_workspace, resumed_result, runtime, resume, log_dir
+    )
+
+
+def _kubectl_delete_coordinator_pod(runner: Any, config: Any, attempt_id: str) -> None:
+    """Delete exactly the owned coordinator Pod for a submitted attempt."""
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"storage-scale-test.nvidia.com/run={attempt_id},"
+            "app.kubernetes.io/component=coordinator",
+            "-o",
+            "json",
+        ),
+        timeout=30,
+    )
+    pods = json.loads(result.stdout).get("items", [])
+    if len(pods) != 1:
+        raise IntegrationTestError(
+            f"expected exactly one coordinator Pod for {attempt_id}, found {len(pods)}"
+        )
+    pod = pods[0]
+    name = str(pod.get("metadata", {}).get("name", ""))
+    observed = str(
+        pod.get("metadata", {})
+        .get("labels", {})
+        .get("storage-scale-test.nvidia.com/run", "")
+    )
+    if not name or observed != attempt_id:
+        raise IntegrationTestError("coordinator Pod ownership evidence is invalid")
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "delete",
+            "pod",
+            name,
+            "--wait=true",
+            "--timeout=60s",
+        ),
+        timeout=75,
+    )
+
+
+def _kubectl_delete_worker_pod(runner: Any, config: Any, attempt_id: str) -> None:
+    """Delete one exact owned worker Pod after endpoint publication."""
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"storage-scale-test.nvidia.com/run={attempt_id},"
+            "app.kubernetes.io/component=workers",
+            "-o",
+            "json",
+        ),
+        timeout=30,
+    )
+    pods = json.loads(result.stdout).get("items", [])
+    candidates = [
+        pod for pod in pods if not pod.get("metadata", {}).get("deletionTimestamp")
+    ]
+    if not candidates:
+        raise IntegrationTestError(
+            "no nonterminating worker Pod is available to replace"
+        )
+    pod = sorted(candidates, key=lambda item: str(item["metadata"]["name"]))[0]
+    name = str(pod["metadata"]["name"])
+    if (
+        pod.get("metadata", {})
+        .get("labels", {})
+        .get("storage-scale-test.nvidia.com/run")
+        != attempt_id
+    ):
+        raise IntegrationTestError("worker Pod ownership evidence is invalid")
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "delete",
+            "pod",
+            name,
+            "--wait=true",
+            "--timeout=60s",
+        ),
+        timeout=75,
+    )
+
+
+def _run_kubectl_cancel(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    _report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Cancel a running attempt twice and collect its durable cancellation."""
+    step = runtime.scenario.steps[0]
+    result_base = str(Path(runtime.workspace) / "results" / step.name)
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(runner, config, fixture, runtime, step, template, result_base)
+    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        step.name,
+        step.render_arguments(runtime.values),
+        log_dir,
+        step.timeout_seconds,
+    )
+    result_root, _attempt_id = _kubectl_submission(output)
+    runtime.values["kubectl_result_root"] = str(result_root)
+    _kubectl_wait_for_state(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        frozenset({"RUNNING"}),
+        step.timeout_seconds,
+    )
+    for index in (1, 2):
+        _run_kubectl_command(
+            runner,
+            config,
+            runtime,
+            f"cancel-{index}",
+            ("--cancel", str(result_root)),
+            log_dir,
+            120,
+        )
+    result = _kubectl_collect_result(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        terminal_states=frozenset({"CANCELLED"}),
+    )
+    runtime.values["kubectl_collected"] = "1"
+    _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "collect-again",
+        ("--collect", str(result_root)),
+        log_dir,
+        120,
+        accepted_states=frozenset({"CANCELLED"}),
+    )
+    status_path = result / "executions" / "0001.status"
+    execution_status = status_path.read_text(encoding="utf-8").strip()
+    if execution_status != "FAILED":
+        raise IntegrationTestError(
+            "cancelled Kubernetes execution was not finalized as failed: "
+            f"{execution_status}"
+        )
+    exit_code = (
+        (result / "executions" / "0001.exitcode").read_text(encoding="utf-8").strip()
+    )
+    if not exit_code.isdigit() or int(exit_code) == 0:
+        raise IntegrationTestError(
+            f"cancelled Kubernetes execution has invalid exit code {exit_code!r}"
+        )
+    collected_status = (
+        result
+        / "kubernetes"
+        / "attempts"
+        / _attempt_id
+        / "collected-state"
+        / "run.status"
+    )
+    if collected_status.read_text(encoding="utf-8").strip() != "CANCELLED":
+        raise IntegrationTestError("collected Kubernetes cancellation is not durable")
+    _assert_dataset_state(
+        runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
+    )
+
+
+def _run_kubectl_mutated_attempt(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+    mutate: Any,
+) -> None:
+    """Run one attempt, mutate its exact resource, and collect the outcome."""
+    step = runtime.scenario.steps[0]
+    result_base = str(Path(runtime.workspace) / "results" / step.name)
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(runner, config, fixture, runtime, step, template, result_base)
+    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        step.name,
+        step.render_arguments(runtime.values),
+        log_dir,
+        step.timeout_seconds,
+    )
+    result_root, attempt_id = _kubectl_submission(output)
+    runtime.values["kubectl_result_root"] = str(result_root)
+    _kubectl_wait_for_state(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        frozenset({"RUNNING"}),
+        step.timeout_seconds,
+    )
+    mutate(attempt_id)
+    terminal = _kubectl_wait_for_state(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        KUBECTL_TERMINAL_STATES,
+        step.timeout_seconds,
+    )
+    accepted = frozenset({terminal}) if terminal != "SUCCESS" else frozenset()
+    result = _kubectl_collect_result(
+        runner,
+        config,
+        runtime,
+        result_root,
+        log_dir,
+        terminal_states=accepted,
+    )
+    runtime.values["kubectl_collected"] = "1"
+    if terminal == "SUCCESS":
+        _assert_execution_contract(runtime.scenario, step, result)
+        _assert_semantic_flags(runtime.scenario.name, step, result)
+        _assert_dataset_state(
+            runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
+        )
+        _assert_scenario_report(
+            runner, report_workspace, result, runtime, step, log_dir
+        )
+        return
+    execution_status = (
+        (result / "executions" / "0001.status").read_text(encoding="utf-8").strip()
+    )
+    if execution_status != "FAILED":
+        raise IntegrationTestError(
+            f"mutated Kubernetes execution ended in {execution_status}, not FAILED"
+        )
+    exit_code = (
+        (result / "executions" / "0001.exitcode").read_text(encoding="utf-8").strip()
+    )
+    if not exit_code.isdigit() or int(exit_code) == 0:
+        raise IntegrationTestError(
+            f"mutated Kubernetes execution has invalid exit code {exit_code!r}"
+        )
+    attempt_dir = result / "kubernetes" / "attempts" / attempt_id
+    if runtime.scenario.name == "kubectl-coordinator-loss":
+        evidence = result / "coordinator-loss.tsv"
+        required = {"observed_status\tRUNNING", "recovered_status\tFAILED"}
+        observed = (
+            set(evidence.read_text(encoding="utf-8").splitlines())
+            if evidence.is_file()
+            else set()
+        )
+        if not required <= observed:
+            raise IntegrationTestError(
+                f"coordinator-loss evidence is incomplete: {sorted(observed)}"
+            )
+    elif runtime.scenario.name == "kubectl-endpoint-drift":
+        evidence = attempt_dir / "endpoint-drift.tsv"
+        if not evidence.is_file() or "\tIP_DRIFT" not in evidence.read_text(
+            encoding="utf-8"
+        ):
+            raise IntegrationTestError("changed worker Pod IP lacks drift evidence")
+    if len(runtime.scenario.steps) < 2:
+        return
+    resume = runtime.scenario.steps[1]
+    runtime.values["failed_results_dir"] = str(result_root)
+    runtime.values["kubectl_collected"] = "0"
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        resume.name,
+        resume.render_arguments(runtime.values),
+        log_dir,
+        resume.timeout_seconds,
+    )
+    resumed_root, resumed_attempt = _kubectl_submission(output)
+    if resumed_attempt == attempt_id:
+        raise IntegrationTestError("Kubernetes resume reused the failed attempt ID")
+    runtime.values["kubectl_result_root"] = str(resumed_root)
+    if (
+        _wait_for_kubectl_terminal_state(
+            runner,
+            config,
+            runtime,
+            resumed_root,
+            log_dir,
+            resume.timeout_seconds,
+        )
+        != "SUCCESS"
+    ):
+        raise IntegrationTestError("Kubernetes resume did not succeed")
+    resumed = _kubectl_collect_result(runner, config, runtime, resumed_root, log_dir)
+    runtime.values["kubectl_collected"] = "1"
+    _assert_execution_contract(runtime.scenario, resume, resumed)
+    _assert_scenario_report(runner, report_workspace, resumed, runtime, resume, log_dir)
+
+
+def _run_kubectl_coordinator_loss(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Exercise terminal collection after deleting the exact coordinator Pod."""
+    _run_kubectl_mutated_attempt(
+        runner,
+        config,
+        fixture,
+        runtime,
+        template,
+        report_workspace,
+        log_dir,
+        lambda attempt: _kubectl_delete_coordinator_pod(runner, config, attempt),
+    )
+
+
+def _run_kubectl_endpoint_drift(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Exercise worker replacement after the attempt endpoint freeze."""
+    _run_kubectl_mutated_attempt(
+        runner,
+        config,
+        fixture,
+        runtime,
+        template,
+        report_workspace,
+        log_dir,
+        lambda attempt: _kubectl_delete_worker_pod(runner, config, attempt),
+    )
 
 
 def _cleanup_kubectl_attempt(
@@ -3460,7 +4190,11 @@ def run_filesystem_tests(
                         extracted,
                     )
                     if step.substrate.value == "kubectl":
-                        _run_kubectl_baseline(
+                        if scenario not in KUBECTL_SUPPORTED_SCENARIOS:
+                            raise IntegrationTestError(
+                                f"Kubernetes scenario has no explicit adapter: {scenario}"
+                            )
+                        kubectl_args = (
                             runner,
                             config,
                             fixture,
@@ -3469,6 +4203,25 @@ def run_filesystem_tests(
                             report_workspace,
                             scenario_logs,
                         )
+                        if scenario == "failure-resume":
+                            _run_kubectl_failure_resume(*kubectl_args)
+                        elif scenario in {
+                            "kubectl-cancel",
+                            "cancel",
+                        }:
+                            _run_kubectl_cancel(*kubectl_args)
+                        elif scenario in {
+                            "kubectl-coordinator-loss",
+                            "coordinator-loss",
+                        }:
+                            _run_kubectl_coordinator_loss(*kubectl_args)
+                        elif scenario in {
+                            "kubectl-endpoint-drift",
+                            "endpoint-drift",
+                        }:
+                            _run_kubectl_endpoint_drift(*kubectl_args)
+                        else:
+                            _run_kubectl_success_scenario(*kubectl_args)
                     elif scenario == "failure-resume":
                         _run_failure_resume(
                             runner,

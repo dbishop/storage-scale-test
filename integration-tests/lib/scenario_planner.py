@@ -107,14 +107,14 @@ SCENARIO_CATALOG = (
     Scenario(
         "default-dio",
         "Default worker-directory direct-I/O lifecycle",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         20,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
     Scenario(
         "failure-resume",
         "Real failure, cleanup, and resume lifecycle",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         30,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
@@ -128,7 +128,7 @@ SCENARIO_CATALOG = (
     Scenario(
         "live-capture",
         "Extended live-data collection and reporting",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         50,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
@@ -166,6 +166,34 @@ SCENARIO_CATALOG = (
         frozenset({Substrate.SLURM}),
         100,
         phase=SchedulePhase.AFTER_SHARED_HOME,
+    ),
+    Scenario(
+        "kubectl-retained-read",
+        "Kubernetes write, collected read-from, and retained data lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        110,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-cancel",
+        "Kubernetes cancellation and repeated collection lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        120,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-coordinator-loss",
+        "Kubernetes coordinator loss, collection, and resume lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        130,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-endpoint-drift",
+        "Kubernetes worker endpoint replacement and health handling",
+        frozenset({Substrate.KUBECTL}),
+        140,
+        phase=SchedulePhase.KUBECTL,
     ),
 )
 

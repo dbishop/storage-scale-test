@@ -75,6 +75,10 @@ def test_catalog_exposes_stable_machine_metadata():
         "ssh-single-big-file",
         "ssh-weighted-roots",
         "ssh-shared-home",
+        "kubectl-retained-read",
+        "kubectl-cancel",
+        "kubectl-coordinator-loss",
+        "kubectl-endpoint-drift",
         "slurm-scheduling",
     ]
     shared = next(item for item in metadata if item["name"] == "ssh-shared-home")
@@ -105,6 +109,13 @@ def test_default_plan_expands_substrates_and_batches_shared_home():
     assert plan[shared_start + 1 : shared_stop] == (("work", "ssh-shared-home", "ssh"),)
     assert plan[shared_stop + 1 :] == (
         ("work", "baseline", "kubectl"),
+        ("work", "default-dio", "kubectl"),
+        ("work", "failure-resume", "kubectl"),
+        ("work", "live-capture", "kubectl"),
+        ("work", "kubectl-retained-read", "kubectl"),
+        ("work", "kubectl-cancel", "kubectl"),
+        ("work", "kubectl-coordinator-loss", "kubectl"),
+        ("work", "kubectl-endpoint-drift", "kubectl"),
         ("work", "slurm-scheduling", "slurm"),
     )
     assert all(
@@ -136,13 +147,24 @@ def test_slurm_selection_needs_no_home_transition():
     assert {step.substrate for step in plan} == {Substrate.SLURM}
 
 
-def test_kubectl_selection_has_no_ssh_transition_and_uses_baseline_only():
+def test_kubectl_selection_has_no_ssh_transition():
     """Kubernetes work is independently selectable and has no SSH side effect."""
     plan = plan_scenarios(
         substrate=Substrate.KUBECTL, registry=_SCENARIOS.SCENARIO_CATALOG
     )
 
-    assert plan == (WorkItem(_SCENARIOS.SCENARIO_CATALOG[0], Substrate.KUBECTL),)
+    assert all(isinstance(step, WorkItem) for step in plan)
+    assert all(step.substrate is Substrate.KUBECTL for step in plan)
+    assert [step.scenario.name for step in plan] == [
+        "baseline",
+        "default-dio",
+        "failure-resume",
+        "live-capture",
+        "kubectl-retained-read",
+        "kubectl-cancel",
+        "kubectl-coordinator-loss",
+        "kubectl-endpoint-drift",
+    ]
 
 
 def test_requested_scenarios_are_order_independent():
