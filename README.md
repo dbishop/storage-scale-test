@@ -159,7 +159,8 @@ export SSH_HOST_LIST=/absolute/path/to/host_list
 # export SSH_HOMEDIR_SHARED=1        # any non-empty value
 ```
 
-Setting `SSH_HOST_LIST` disables Slurm settings. Authentication must be
+`SSH_HOST_LIST` is used only when `EXECUTION_SUBSTRATE=ssh`; it does not select
+the substrate or disable Slurm configuration. Authentication must be
 non-interactive. Run `validate_env.sh` to verify connectivity.
 
 ### Slurm options
@@ -189,6 +190,9 @@ export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
 export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
 ```
 
 The namespace and the named PV/PVC must already exist and the PVC must be

@@ -805,13 +805,25 @@ def _asset_url(name: str) -> str:
     return str(matches[0]["url"])
 
 
+def _publish_temporary_file(temporary: Path, destination: Path, mode: int) -> None:
+    """Publish one temporary file and remove it after every failure mode."""
+    try:
+        temporary.chmod(mode)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _download_archive(destination: Path, name: str, expected: str) -> None:
     """Download and verify one pinned elbencho archive atomically."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     url = _asset_url(name)
-    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
-        temporary = Path(handle.name)
-        try:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
             with _request(url, "application/octet-stream") as response:
                 content_length = response.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_ARCHIVE_BYTES:
@@ -827,17 +839,15 @@ def _download_archive(destination: Path, name: str, expected: str) -> None:
                             f"{MAX_ARCHIVE_BYTES} bytes"
                         )
                     handle.write(chunk)
-        except Exception:
+        actual = _sha256(temporary)
+        if actual != expected:
+            raise IntegrationTestError(
+                f"checksum mismatch for {name}: expected {expected}, got {actual}"
+            )
+        _publish_temporary_file(temporary, destination, 0o640)
+    finally:
+        if temporary is not None:
             temporary.unlink(missing_ok=True)
-            raise
-    actual = _sha256(temporary)
-    if actual != expected:
-        temporary.unlink(missing_ok=True)
-        raise IntegrationTestError(
-            f"checksum mismatch for {name}: expected {expected}, got {actual}"
-        )
-    temporary.chmod(0o640)
-    temporary.replace(destination)
 
 
 def _extract_container_elbencho(
@@ -922,14 +932,18 @@ def _sbx_bundle_document(architecture: str, binary_name: str) -> dict[str, objec
 
 def _write_sbx_bundle_marker(path: Path, document: dict[str, object]) -> None:
     """Atomically record a successfully built SBX Elbencho bundle."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as handle:
-        json.dump(document, handle, sort_keys=True)
-        handle.write("\n")
-        temporary = Path(handle.name)
-    temporary.chmod(0o640)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(document, handle, sort_keys=True)
+            handle.write("\n")
+        _publish_temporary_file(temporary, path, 0o640)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _sbx_bundle_is_current(
@@ -988,11 +1002,15 @@ def _ensure_elbencho(
         source = tar.extractfile(members[0])
         if source is None:
             raise IntegrationTestError(f"cannot extract elbencho from {archive}")
-        with tempfile.NamedTemporaryFile(dir=cache, delete=False) as handle:
-            temporary = Path(handle.name)
-            shutil.copyfileobj(source, handle)
-    temporary.chmod(0o755)
-    temporary.replace(binary)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cache, delete=False) as handle:
+                temporary = Path(handle.name)
+                shutil.copyfileobj(source, handle)
+            _publish_temporary_file(temporary, binary, 0o755)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return binary, binary_name, None
 
 

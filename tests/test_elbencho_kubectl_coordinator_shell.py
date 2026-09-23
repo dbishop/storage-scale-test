@@ -417,6 +417,82 @@ def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
     ).read_text(encoding="utf-8")
 
 
+def test_lost_coordinator_recovery_publishes_all_terminal_success(tmp_path):
+    """A crash after the final cell is terminal still becomes collectable."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "RUNNING"
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "SUCCESS"
+    manifest = (state_dir / "publication-manifest.tsv").read_text(encoding="utf-8")
+    assert "execution\t0001\tSUCCESS" in manifest
+    assert "recovered_status\tSUCCESS" in (
+        state_dir / "coordinator-loss.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_lost_coordinator_recovery_preserves_all_terminal_failure(tmp_path):
+    """All-terminal recovery retains a failed cell's durable exit code."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_ELBENCHO_FAIL_ID="0001",
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    assert "recovered_status\tFAILED" in (state_dir / "coordinator-loss.tsv").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_lost_coordinator_keeps_later_pending_cells_after_terminal_failure(tmp_path):
+    """Recovery does not misattribute a prior failure to the next cell."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_ELBENCHO_FAIL_ID="0001",
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0001.exitcode").read_text(
+        encoding="utf-8"
+    ).strip() == "1"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+    assert "execution\t0002\tPENDING" in (
+        state_dir / "publication-manifest.tsv"
+    ).read_text(encoding="utf-8")
+
+
 def test_lost_coordinator_before_first_cell_publishes_resumable_failure(tmp_path):
     """A Job lost after run startup marks the first pending cell resumable."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)

@@ -28,6 +28,7 @@ fi
 readonly KUBECTL_SWEEP_RESERVED_ROOT=.storage-scale-test
 readonly KUBECTL_ATTEMPT_SCHEMA_VERSION=1
 readonly KUBECTL_ATTEMPT_RESOURCE_SCHEMA_VERSION=1
+readonly KUBECTL_ATTEMPT_CREATION_INTENT_SCHEMA_VERSION=1
 readonly KUBECTL_COLLECTION_MAX_BYTES=$((2 * 1024 * 1024 * 1024))
 readonly KUBECTL_COLLECTION_MAX_MEMBERS=50000
 readonly KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT=7200
@@ -263,6 +264,9 @@ _kubectl_validate_local_directory_path() {
             echo "Error: Kubernetes local state paths may not contain '.' or '..'" >&2
             return 1
         }
+    done
+    for component in "${path_components[@]}"; do
+        [[ -n "$component" ]] || continue
         [[ ! -L "$current/$component" ]] || {
             echo "Error: Kubernetes local state may not traverse a symbolic link" >&2
             return 1
@@ -373,6 +377,37 @@ kubectl_attempt_write_current() {
     local tmp="$kubernetes_dir/current-attempt.tmp.${BASHPID:-$$}.$RANDOM"
     printf '%s\n' "$attempt_id" > "$tmp" \
         && mv -f "$tmp" "$kubernetes_dir/current-attempt"
+}
+
+kubectl_attempt_write_predecessor() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" predecessor="$4"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && "$predecessor" =~ ^[0-9a-f]{8}$ ]] || return 1
+    kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+    local path="$kubernetes_dir/attempts/$attempt_id/predecessor-attempt"
+    local tmp="$path.tmp.${BASHPID:-$$}.$RANDOM"
+    if ! printf '%s\n' "$predecessor" > "$tmp" \
+        || ! mv -n "$tmp" "$path" 2>/dev/null; then
+            rm -f -- "$tmp"
+            return 1
+    fi
+    [[ ! -e "$tmp" ]] || {
+        rm -f -- "$tmp"
+        return 1
+    }
+}
+
+kubectl_attempt_restore_predecessor() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
+    local path="$kubernetes_dir/attempts/$attempt_id/predecessor-attempt"
+    [[ ! -e "$path" ]] && return 0
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    local predecessor
+    predecessor=$(cat -- "$path") || return 1
+    [[ "$predecessor" =~ ^[0-9a-f]{8}$ ]] || return 1
+    kubectl_attempt_write_current "$kubernetes_dir" "$lock_fd" "$predecessor"
 }
 
 kubectl_attempt_write_state() {
@@ -551,7 +586,14 @@ kubectl_verify_object_identity() {
 kubectl_create_owned_object() {
     local output_variable="$1" kind="$2" name="$3" namespace="$4"
     local nonce="$5" run_id="$6" manifest="$7"
+    local kubernetes_dir="${8:-}" lock_fd="${9:-}" resource_key="${10:-}"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    if [[ -n "$kubernetes_dir" || -n "$lock_fd" || -n "$resource_key" ]]; then
+        [[ -n "$kubernetes_dir" && -n "$lock_fd" && -n "$resource_key" ]] || return 1
+        kubectl_attempt_write_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$run_id" "$resource_key" "$kind" "$name" "$namespace" "$nonce" \
+            || return 1
+    fi
     local create_output=""
     if ! create_output=$(printf '%s' "$manifest" \
             | kubectl_run_bounded -n "$namespace" create -f - 2>&1); then
@@ -585,6 +627,27 @@ kubectl_attempt_remote_root() {
 kubectl_attempt_remote_lock_directory() {
     printf '%s/%s/locks/kubernetes-elbencho-sweep\n' \
         "$KUBECTL_SWEEP_MOUNT_ROOT" "$KUBECTL_SWEEP_RESERVED_ROOT"
+}
+
+# This fragment is embedded in every remote control-tree mutation.  The
+# lexical check prevents argument substitution, while the realpath checks
+# detect a reserved run or any of its parents being replaced by a symlink
+# between lifecycle operations.  Keep it self-contained: it runs in the
+# workload image, not in the submitting shell.
+kubectl_remote_tree_guard_script() {
+    cat <<'EOF'
+run=$1
+attempt=$2
+mount=/mnt/storage-scale-test
+root=$mount/.storage-scale-test
+[[ "$attempt" =~ ^[0-9a-f]{8}$ && "$run" == "$root/runs/$attempt" ]] || exit 1
+mount_real=$(realpath -e -- "$mount") || exit 1
+root_real=$(realpath -e -- "$root") || exit 1
+[[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+[[ -d "$run" && ! -L "$run" ]] || exit 1
+run_real=$(realpath -e -- "$run") || exit 1
+[[ "$run_real" == "$root_real/runs/$attempt" ]] || exit 1
+EOF
 }
 
 kubectl_validate_remote_run_directory() {
@@ -653,6 +716,62 @@ kubectl_attempt_journal_resource() {
         rm -f -- "$tmp"
         return 1
     }
+}
+
+kubectl_attempt_write_creation_intent() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_key="$4"
+    local kind="$5" name="$6" namespace="$7" nonce="$8"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] \
+        && _kubectl_validate_resource_key "$resource_key" \
+        && [[ "$kind" =~ ^[A-Za-z][A-Za-z0-9.-]*$ ]] \
+        && kubectl_validate_object_name "$name" \
+        && kubectl_validate_namespace_name "$namespace" \
+        && [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+    local intent_dir="$kubernetes_dir/attempts/$attempt_id/creation-intents"
+    mkdir -p "$intent_dir" || return 1
+    local intent_file="$intent_dir/$resource_key.sh"
+    [[ ! -e "$intent_file" && ! -L "$intent_file" ]] || return 1
+    local tmp="$intent_file.tmp.${BASHPID:-$$}.$RANDOM"
+    {
+        printf '# Trusted storage-scale-test Kubernetes creation intent.\n'
+        printf 'KUBECTL_INTENT_SCHEMA=%q\n' "$KUBECTL_ATTEMPT_CREATION_INTENT_SCHEMA_VERSION"
+        printf 'KUBECTL_INTENT_KIND=%q\n' "$kind"
+        printf 'KUBECTL_INTENT_NAME=%q\n' "$name"
+        printf 'KUBECTL_INTENT_NAMESPACE=%q\n' "$namespace"
+        printf 'KUBECTL_INTENT_NONCE=%q\n' "$nonce"
+    } > "$tmp" || return 1
+    mv -n "$tmp" "$intent_file" 2>/dev/null || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    [[ ! -e "$tmp" ]] || {
+        rm -f -- "$tmp"
+        return 1
+    }
+}
+
+kubectl_attempt_load_creation_intent() {
+    local intent_file="$1"
+    [[ -f "$intent_file" && ! -L "$intent_file" ]] || return 1
+    unset KUBECTL_INTENT_SCHEMA KUBECTL_INTENT_KIND KUBECTL_INTENT_NAME
+    unset KUBECTL_INTENT_NAMESPACE KUBECTL_INTENT_NONCE
+    # shellcheck disable=SC1090  # Trusted, result-directory-local intent.
+    source "$intent_file" || return 1
+    [[ "$KUBECTL_INTENT_SCHEMA" == "$KUBECTL_ATTEMPT_CREATION_INTENT_SCHEMA_VERSION" \
+        && "$KUBECTL_INTENT_KIND" =~ ^[A-Za-z][A-Za-z0-9.-]*$ \
+        && "$KUBECTL_INTENT_NONCE" =~ ^[0-9a-f]{32}$ ]] \
+        && kubectl_validate_object_name "$KUBECTL_INTENT_NAME" \
+        && kubectl_validate_namespace_name "$KUBECTL_INTENT_NAMESPACE"
+}
+
+kubectl_attempt_clear_creation_intent() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_key="$4"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] \
+        && _kubectl_validate_resource_key "$resource_key" || return 1
+    local intent_file="$kubernetes_dir/attempts/$attempt_id/creation-intents/$resource_key.sh"
+    [[ ! -e "$intent_file" && ! -L "$intent_file" ]] || rm -f -- "$intent_file"
 }
 
 kubectl_attempt_load_resource() {
@@ -741,7 +860,10 @@ kubectl_attempt_write_configuration() {
         rm -f -- "$tmp"
         return 1
     }
-    [[ ! -e "$tmp" ]] || return 1
+    [[ ! -e "$tmp" ]] || {
+        rm -f -- "$tmp"
+        return 1
+    }
 }
 
 kubectl_render_node_selector() {
@@ -893,16 +1015,35 @@ kubectl_validate_runtime_pod() {
     nonce=$(kubectl_generate_ownership_nonce) || return 1
     operation_token=$(_kubectl_random_hex 4) || return 1
     helper_name="sst-elb-$attempt_id-status-$operation_token"
-    kubectl_create_helper_pod helper_uid status "$KUBECTL_NAMESPACE" "$helper_name" \
-        "$nonce" "$attempt_id" "$node" "$operation_token" || return 1
+    if ! kubectl_create_helper_pod helper_uid status "$KUBECTL_NAMESPACE" "$helper_name" \
+            "$nonce" "$attempt_id" "$node" "$operation_token"; then
+        [[ -z "${helper_uid:-}" ]] || kubectl_delete_owned_object Pod "$helper_name" \
+            "$KUBECTL_NAMESPACE" "$nonce" "$attempt_id" "$helper_uid" || true
+        return 1
+    fi
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
     kubectl_pvc_exec "$KUBECTL_NAMESPACE" "$helper_name" /bin/bash -ceu '
         test "$(id -u)" = "$1"
         test "$(id -g)" = "$2"
-        command -v elbencho
-        command -v bash
-        command -v tar
-        command -v realpath
+        # This is the complete external-command contract of the
+        # digest-verified coordinator and its elbencho helper library. Keep
+        # this preflight in lockstep with coordinator changes so a Job cannot
+        # fail only after durable state has been prepared.
+        for command in \
+            elbencho bash tar realpath timeout sha256sum awk find grep mkdir cp \
+            cmp date shuf mv wc cat sed rm sort basename dirname sleep mktemp \
+            tr xargs rmdir id cut od; do
+            command -v "$command"
+        done
+        if ! type -P stat >/dev/null 2>&1 \
+                && ! type -P gstat >/dev/null 2>&1; then
+            exit 1
+        fi
+        if ! type -P pkill >/dev/null 2>&1 \
+                && ! type -P killall >/dev/null 2>&1; then
+            exit 1
+        fi
+        test -x /usr/bin/elbencho
         test -r /mnt/storage-scale-test && test -w /mnt/storage-scale-test
     ' bash "$KUBECTL_RUN_AS_USER" "$KUBECTL_RUN_AS_GROUP" || rc=1
     kubectl_delete_owned_object Pod "$helper_name" "$KUBECTL_NAMESPACE" "$nonce" \
@@ -1000,6 +1141,7 @@ kubectl_wait_owned_ready_pod() {
 kubectl_create_helper_pod() {
     local output_variable="$1" template_name="$2" namespace="$3" name="$4"
     local nonce="$5" run_id="$6" node_name="$7" operation_token="$8"
+    local kubernetes_dir="${9:-}" lock_fd="${10:-}" resource_key="${11:-}"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
         && [[ "$template_name" =~ ^(transfer|status|collector)$ ]] \
         && kubectl_validate_namespace_name "$namespace" \
@@ -1018,13 +1160,26 @@ kubectl_create_helper_pod() {
         "RUN_AS_USER=$KUBECTL_RUN_AS_USER" "RUN_AS_GROUP=$KUBECTL_RUN_AS_GROUP" \
         "PVC_NAME=$KUBECTL_PVC" "NODE_NAME=$node_name") || return 1
     kubectl_create_owned_object _kubectl_created_helper_uid Pod "$name" "$namespace" \
-        "$nonce" "$run_id" "$manifest" || return 1
+        "$nonce" "$run_id" "$manifest" "$kubernetes_dir" "$lock_fd" "$resource_key" || return 1
+    printf -v "$output_variable" '%s' "$_kubectl_created_helper_uid"
+    if [[ -n "$kubernetes_dir" ]]; then
+        kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$run_id" \
+            "$resource_key" Pod "$name" "$namespace" \
+            "$_kubectl_created_helper_uid" "$nonce" || {
+                kubectl_delete_owned_object Pod "$name" "$namespace" "$nonce" \
+                    "$run_id" "$_kubectl_created_helper_uid" || true
+                return 1
+            }
+        kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$run_id" "$resource_key" || return 1
+    fi
     if ! kubectl_wait_owned_ready_pod "$namespace" "$name" "$nonce" "$run_id"; then
-        kubectl_delete_owned_object Pod "$name" "$namespace" "$nonce" "$run_id" \
-            "$_kubectl_created_helper_uid" || true
+        if [[ -z "$kubernetes_dir" ]]; then
+            kubectl_delete_owned_object Pod "$name" "$namespace" "$nonce" "$run_id" \
+                "$_kubectl_created_helper_uid" || true
+        fi
         return 1
     fi
-    printf -v "$output_variable" '%s' "$_kubectl_created_helper_uid"
 }
 
 kubectl_pvc_exec() {
@@ -1104,6 +1259,10 @@ kubectl_reserve_remote_attempt() {
         mount=${root%/.storage-scale-test}
         [[ "$root" == /mnt/storage-scale-test/.storage-scale-test \
             && -d "$mount" && ! -L "$mount" ]] || exit 1
+        mount_real=$(realpath -e -- "$mount") || exit 1
+        root_real=$(realpath -m -- "$root") || exit 1
+        [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+        umask 077
         made_lock=0 made_run=0
         cleanup() {
             [[ $made_run -eq 0 ]] || rm -rf -- "$run"
@@ -1117,6 +1276,8 @@ kubectl_reserve_remote_attempt() {
                 mkdir -- "$path"
             fi
         done
+        root_real=$(realpath -e -- "$root") || exit 1
+        [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
         mkdir -- "$lock"
         made_lock=1
         owner="$lock/owner"
@@ -1212,12 +1373,27 @@ kubectl_release_remote_attempt() {
             lock=$1 run=$2 attempt=$3 nonce=$4
             expected=$(printf "%s\\t%s" "$attempt" "$nonce")
             case "$run" in /mnt/storage-scale-test/.storage-scale-test/runs/????????) ;; *) exit 1 ;; esac
+            mount=/mnt/storage-scale-test
+            root=$mount/.storage-scale-test
+            mount_real=$(realpath -e -- "$mount") || exit 1
+            root_real=$(realpath -e -- "$root") || exit 1
+            [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
             if [[ ! -e "$lock" && ! -L "$lock" && ! -e "$run" && ! -L "$run" ]]; then
                 exit 0
             fi
+            if [[ -e "$lock" || -L "$lock" ]]; then
+                [[ -d "$lock" && ! -L "$lock" ]] || exit 1
+                lock_real=$(realpath -e -- "$lock") || exit 1
+                [[ "$lock_real" == "$root_real/locks/kubernetes-elbencho-sweep" ]] || exit 1
+            fi
+            if [[ -e "$run" || -L "$run" ]]; then
+                [[ -d "$run" && ! -L "$run" ]] || exit 1
+                run_real=$(realpath -e -- "$run") || exit 1
+                [[ "$run_real" == "$root_real/runs/$attempt" ]] || exit 1
+            fi
             [[ -d "$lock" && ! -L "$lock" \
+                && -f "$lock/owner" && ! -L "$lock/owner" \
                 && $(cat -- "$lock/owner") == "$expected" ]] || exit 1
-            [[ ! -L "$run" ]] || exit 1
             rm -rf -- "$run"
             [[ ! -e "$run" && ! -L "$run" ]]
         ' bash "$lock_dir" "$remote_run" "$attempt_id" "$nonce" || return 1
@@ -1234,7 +1410,16 @@ kubectl_release_remote_attempt() {
             if [[ ! -e "$lock" && ! -L "$lock" ]]; then
                 exit 0
             fi
+            mount=/mnt/storage-scale-test
+            root=$mount/.storage-scale-test
+            mount_real=$(realpath -e -- "$mount") || exit 1
+            root_real=$(realpath -e -- "$root") || exit 1
+            [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+            [[ -d "$lock" && ! -L "$lock" ]] || exit 1
+            lock_real=$(realpath -e -- "$lock") || exit 1
+            [[ "$lock_real" == "$root_real/locks/kubernetes-elbencho-sweep" ]] || exit 1
             [[ -d "$lock" && ! -L "$lock" \
+                && -f "$lock/owner" && ! -L "$lock/owner" \
                 && $(cat -- "$lock/owner") == "$expected" ]] || exit 1
             rm -rf -- "$lock"
             [[ ! -e "$lock" && ! -L "$lock" ]]
@@ -1579,35 +1764,43 @@ kubectl_wait_journaled_job_quiescent() {
 kubectl_recover_lost_coordinator() {
     local namespace="$1" helper_pod="$2" attempt_id="$3"
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
-    local remote_run control state scratch
+    local remote_run state scratch
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    control="$remote_run/control"
     state="$remote_run/state"
     scratch="/tmp/storage-scale-test/$attempt_id"
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     # The recovery mode is part of the digest-verified coordinator bundle and
     # only edits a PVC attempt whose Job has already reached Failed. It does
     # not need API credentials or a new coordinator Pod.
     # shellcheck disable=SC2016  # Positional parameters expand in the helper Pod.
-    kubectl_pvc_exec "$namespace" "$helper_pod" /bin/bash -ceu \
-        'exec "$1/coordinator.sh" --recover-lost "$1" "$2" "$3" "$4"' \
-        bash "$control" "$state" "$scratch" "$attempt_id"
+    kubectl_pvc_exec "$namespace" "$helper_pod" /bin/bash -ceu "$guard_script
+        control=\$run/control
+        state=\$run/state
+        [[ -d \"\$control\" && ! -L \"\$control\" && -d \"\$state\" && ! -L \"\$state\" ]] || exit 1
+        exec \"\$control/coordinator.sh\" \"\$4\" \"\$control\" \"\$state\" \"\$3\" \"\$2\"" \
+        bash "$remote_run" "$attempt_id" "$scratch" --recover-lost
 }
 
 kubectl_finalize_cancelled_attempt() {
     local namespace="$1" helper_pod="$2" attempt_id="$3"
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
-    local remote_run control state scratch
+    local remote_run state scratch
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    control="$remote_run/control"
     state="$remote_run/state"
     scratch="/tmp/storage-scale-test/$attempt_id"
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     # The Job has already been deleted. Finalize its durable ledger through a
     # short-lived helper so cancellation remains collectable even when the
     # coordinator did not receive enough grace time to publish its own exit.
     # shellcheck disable=SC2016  # Positional parameters expand in the helper Pod.
-    kubectl_pvc_exec "$namespace" "$helper_pod" /bin/bash -ceu \
-        'exec "$1/coordinator.sh" --finalize-cancelled "$1" "$2" "$3" "$4"' \
-        bash "$control" "$state" "$scratch" "$attempt_id"
+    kubectl_pvc_exec "$namespace" "$helper_pod" /bin/bash -ceu "$guard_script
+        control=\$run/control
+        state=\$run/state
+        [[ -d \"\$control\" && ! -L \"\$control\" && -d \"\$state\" && ! -L \"\$state\" ]] || exit 1
+        exec \"\$control/coordinator.sh\" \"\$4\" \"\$control\" \"\$state\" \"\$3\" \"\$2\"" \
+        bash "$remote_run" "$attempt_id" "$scratch" --finalize-cancelled
 }
 
 kubectl_record_remote_status() {
@@ -1616,14 +1809,18 @@ kubectl_record_remote_status() {
         && "$status" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] || return 1
     local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
-        run=$1 status=$2
-        [[ -d "$run/state" ]] || exit 1
-        tmp="$run/state/run.status.tmp.$$"
-        printf "%s\\n" "$status" > "$tmp"
-        mv -f -- "$tmp" "$run/state/run.status"
-    ' bash "$remote_run" "$status"
+    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
+        status=\$3
+        [[ -d \"\$run/state\" && ! -L \"\$run/state\" ]] || exit 1
+        state_real=\$(realpath -e -- \"\$run/state\") || exit 1
+        [[ \"\$state_real\" == \"\$run_real/state\" ]] || exit 1
+        tmp=\"\$run/state/run.status.tmp.\$\$\"
+        printf \"%s\\\\n\" \"\$status\" > \"\$tmp\"
+        mv -f -- \"\$tmp\" \"\$run/state/run.status\"
+    " bash "$remote_run" "$attempt_id" "$status"
 }
 
 kubectl_read_remote_status() {
@@ -1631,10 +1828,14 @@ kubectl_read_remote_status() {
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
     local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     local status
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
     status=$(kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu \
-        'test -f "$1/state/run.status" && cat -- "$1/state/run.status"' bash "$remote_run") || return 1
+        "$guard_script
+        [[ -f \"\$run/state/run.status\" && ! -L \"\$run/state/run.status\" ]] || exit 1
+        cat -- \"\$run/state/run.status\"" bash "$remote_run" "$attempt_id") || return 1
     [[ "$status" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] || return 1
     printf '%s\n' "$status"
 }
@@ -1644,17 +1845,18 @@ kubectl_stream_remote_attempt() {
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && -n "$archive_path" && ! -e "$archive_path" ]] || return 1
     local collection_timeout="${KUBECTL_COLLECTION_TIMEOUT_SECONDS:-$KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT}"
     [[ "$collection_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
-    local remote_run parent base
+    local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    parent="${remote_run%/*}"
-    base="${remote_run##*/}"
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     umask 077
     # A valid collection can contain up to two GiB. Do not inherit the short
     # API-probe deadline used for status and object inspection.
     KUBECTL_REQUEST_TIMEOUT_SECONDS="$collection_timeout" \
         KUBECTL_PROCESS_TIMEOUT_SECONDS=$((collection_timeout + 60)) \
-        kubectl_pvc_exec "$namespace" "$pod_name" tar -C "$parent" -cf - "$base" \
-            > "$archive_path" || {
+        kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
+            exec tar -C \"\${run%/*}\" -cf - \"\${run##*/}\"" \
+            bash "$remote_run" "$attempt_id" > "$archive_path" || {
         rm -f -- "$archive_path"
         return 1
     }
@@ -1775,18 +1977,20 @@ kubectl_create_attempt_policies() {
         "NAMESPACE=$namespace" "RESOURCE_NAME=$worker_name" "ATTEMPT_ID=$attempt_id" \
         "OWNERSHIP_NONCE=$nonce") || return 1
     kubectl_create_owned_object uid NetworkPolicy "$worker_name" "$namespace" "$nonce" \
-        "$attempt_id" "$manifest" || return 1
+        "$attempt_id" "$manifest" "$kubernetes_dir" "$lock_fd" worker-net || return 1
     kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$attempt_id" \
         worker-net NetworkPolicy "$worker_name" "$namespace" "$uid" "$nonce" || {
             kubectl_delete_owned_object NetworkPolicy "$worker_name" "$namespace" "$nonce" \
                 "$attempt_id" "$uid" || true
             return 1
         }
+    kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+        "$attempt_id" worker-net || return 1
     manifest=$(kubectl_render_attempt_template "$template_dir/coordinator-network-policy.yaml.tmpl" \
         "NAMESPACE=$namespace" "RESOURCE_NAME=$coordinator_name" "ATTEMPT_ID=$attempt_id" \
         "OWNERSHIP_NONCE=$nonce") || return 1
     kubectl_create_owned_object uid NetworkPolicy "$coordinator_name" "$namespace" "$nonce" \
-        "$attempt_id" "$manifest" || {
+        "$attempt_id" "$manifest" "$kubernetes_dir" "$lock_fd" coord-net || {
             kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" "$attempt_id" || true
             return 1
         }
@@ -1797,6 +2001,8 @@ kubectl_create_attempt_policies() {
             kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" "$attempt_id" || true
             return 1
         }
+    kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+        "$attempt_id" coord-net || return 1
 }
 
 kubectl_create_worker_daemonset() {
@@ -1820,13 +2026,15 @@ kubectl_create_worker_daemonset() {
         "PVC_NAME=$KUBECTL_PVC" "NODE_SELECTOR_BLOCK=$selector_block" \
         "NODE_AFFINITY_VALUES=$affinity_block") || return 1
     kubectl_create_owned_object uid DaemonSet "$name" "$namespace" "$nonce" \
-        "$attempt_id" "$manifest" || return 1
+        "$attempt_id" "$manifest" "$kubernetes_dir" "$lock_fd" workers || return 1
     kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$attempt_id" \
         workers DaemonSet "$name" "$namespace" "$uid" "$nonce" || {
             kubectl_delete_owned_object DaemonSet "$name" "$namespace" "$nonce" \
                 "$attempt_id" "$uid" || true
             return 1
         }
+    kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+        "$attempt_id" workers || return 1
 }
 
 kubectl_initialize_remote_control_tree() {
@@ -1834,17 +2042,17 @@ kubectl_initialize_remote_control_tree() {
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
     local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
-        run=$1
-        test -d "$run"
-        [[ ! -e "$run/control" && ! -e "$run/state" && ! -e "$run/results" ]] || exit 1
-        mkdir -- "$run/control" "$run/state" "$run/results"
-        mkdir -- "$run/control/executions" "$run/state/executions" "$run/results/executions"
+    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
         umask 077
-        : > "$run/state/publication-manifest.tsv"
-        printf "PREPARED\\n" > "$run/state/run.status"
-    ' bash "$remote_run"
+        [[ ! -e \"\$run/control\" && ! -e \"\$run/state\" && ! -e \"\$run/results\" ]] || exit 1
+        mkdir -- \"\$run/control\" \"\$run/state\" \"\$run/results\"
+        mkdir -- \"\$run/control/executions\" \"\$run/state/executions\" \"\$run/results/executions\"
+        : > \"\$run/state/publication-manifest.tsv\"
+        printf \"PREPARED\\\\n\" > \"\$run/state/run.status\"
+    " bash "$remote_run" "$attempt_id"
 }
 
 kubectl_prepare_control_bundle() {
@@ -1887,6 +2095,8 @@ kubectl_upload_control_bundle() {
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && -d "$source_dir" ]] || return 1
     local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
+    local guard_script
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
     # Reject link-bearing controls before streaming. The remote extraction is
     # intentionally constrained to the reserved, already-reserved run tree.
     local listing_path path type links
@@ -1935,9 +2145,16 @@ kubectl_upload_control_bundle() {
         return 1
     fi
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    if ! kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu \
-            'run=$1; test -d "$run/control"; tar -C "$run/control" -xf -' \
-            bash "$remote_run" < "$archive_path"; then
+    if ! kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
+            control=\"\$run/control\"
+            [[ -d \"\$control\" && ! -L \"\$control\" ]] || exit 1
+            control_real=\$(realpath -e -- \"\$control\") || exit 1
+            [[ \"\$control_real\" == \"\$run_real/control\" ]] || exit 1
+            if find -P \"\$control\" -type l -print -quit | grep -q .; then
+                exit 1
+            fi
+            exec tar -C \"\$control\" -xf -" \
+            bash "$remote_run" "$attempt_id" < "$archive_path"; then
         rm -f -- "$archive_path"
         return 1
     fi
@@ -1947,7 +2164,44 @@ kubectl_upload_control_bundle() {
 kubectl_cleanup_journaled_resources() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
-    local key resource_file primary_rc=0 rc
+    local key resource_file intent_file primary_rc=0 rc observed_uid
+    for intent_file in "$kubernetes_dir/attempts/$attempt_id/creation-intents"/*.sh; do
+        [[ -e "$intent_file" || -L "$intent_file" ]] || continue
+        if [[ ! -f "$intent_file" || -L "$intent_file" ]]; then
+            printf 'Error: invalid Kubernetes creation intent path for %s\n' \
+                "$(basename "$intent_file")" >&2
+            primary_rc=1
+            continue
+        fi
+        key=$(basename "$intent_file" .sh)
+        kubectl_attempt_load_creation_intent "$intent_file" || {
+            printf 'Error: corrupt Kubernetes creation intent for %s\n' "$key" >&2
+            primary_rc=1
+            continue
+        }
+        observed_uid=$(kubectl_run_bounded -n "$KUBECTL_INTENT_NAMESPACE" \
+            get "$KUBECTL_INTENT_KIND" "$KUBECTL_INTENT_NAME" --ignore-not-found \
+            -o 'jsonpath={.metadata.uid}') || {
+                primary_rc=1
+                continue
+            }
+        if [[ -z "$observed_uid" ]]; then
+            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" "$key" || primary_rc=1
+            continue
+        fi
+        if kubectl_verify_object_identity "$KUBECTL_INTENT_KIND" \
+                "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
+                "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid" \
+                && kubectl_delete_owned_object "$KUBECTL_INTENT_KIND" \
+                    "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
+                    "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid"; then
+            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" "$key" || primary_rc=1
+        else
+            primary_rc=1
+        fi
+    done
     local -a keys=(sweep workers transfer status collector coord-net worker-net)
     for resource_file in "$kubernetes_dir/attempts/$attempt_id/resources"/{status,collector}-*.sh; do
         [[ -f "$resource_file" && ! -L "$resource_file" ]] || continue
@@ -2069,12 +2323,22 @@ kubectl_prepare_attempt_lifecycle() {
         kubectl_attempt_create_identity "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" "$nonce" \
             "$KUBECTL_NAMESPACE" "$namespace_uid" "$KUBECTL_PV" "$pv_uid" \
             "$KUBECTL_PVC" "$pvc_uid" || primary_rc=1
+        if [[ "$primary_rc" -eq 0 && -n "$current_attempt" ]]; then
+            kubectl_attempt_write_predecessor "$kubernetes_dir" "$lock_fd" \
+                "$generated_attempt_id" "$current_attempt" || primary_rc=1
+        fi
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
         kubectl_attempt_write_state "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" PREPARED \
             && kubectl_attempt_write_configuration "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" \
                 "$mapped_dirs_name" "$mapped_read_from" \
             || primary_rc=1
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
+        # Publish the PREPARED pointer before any Kubernetes or PVC mutation.
+        # A killed submitter can then be found and retried by status/cancel.
+        kubectl_attempt_write_current "$kubernetes_dir" "$lock_fd" \
+            "$generated_attempt_id" || primary_rc=1
     fi
     candidate_nodes="$kubernetes_dir/attempts/${generated_attempt_id:-invalid}/nodes.tsv"
     if [[ "$primary_rc" -eq 0 ]]; then
@@ -2087,15 +2351,8 @@ kubectl_prepare_attempt_lifecycle() {
         operation_token=$(_kubectl_random_hex 4) || primary_rc=1
         helper_name="sst-elb-$generated_attempt_id-upload-$operation_token"
         kubectl_create_helper_pod helper_uid transfer "$KUBECTL_NAMESPACE" "$helper_name" \
-            "$nonce" "$generated_attempt_id" "$coordinator_node" "$operation_token" || primary_rc=1
-    fi
-    if [[ "$primary_rc" -eq 0 ]]; then
-        kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" transfer \
-            Pod "$helper_name" "$KUBECTL_NAMESPACE" "$helper_uid" "$nonce" || {
-                kubectl_delete_owned_object Pod "$helper_name" "$KUBECTL_NAMESPACE" "$nonce" \
-                    "$generated_attempt_id" "$helper_uid" || true
-                primary_rc=1
-            }
+            "$nonce" "$generated_attempt_id" "$coordinator_node" "$operation_token" \
+            "$kubernetes_dir" "$lock_fd" transfer || primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
         local -n mapped_dirs_ref="$mapped_dirs_name"
@@ -2132,26 +2389,33 @@ kubectl_prepare_attempt_lifecycle() {
                 "$kubernetes_dir/attempts/$generated_attempt_id/worker-endpoints.tsv" \
             || primary_rc=1
     fi
-    if [[ "$primary_rc" -eq 0 ]]; then
-        # Publish only an attempt that owns its PVC reservation and has complete
-        # worker evidence. The optional expected-current value makes a resume
-        # a compare-and-swap operation under the lifecycle lock.
-        kubectl_attempt_write_current "$kubernetes_dir" "$lock_fd" \
-            "$generated_attempt_id" || primary_rc=1
-    fi
     if [[ "$primary_rc" -ne 0 ]]; then
-        if [[ -n "${generated_attempt_id:-}" && -f "$kubernetes_dir/attempts/$generated_attempt_id/state.sh" ]]; then
-            kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$generated_attempt_id" >/dev/null 2>&1 \
-                && [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]] \
-                && kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" SUBMISSION_FAILED \
-                || true
-        fi
+        local rollback_rc=0
+        # Keep PREPARED as the recovery state until every exact external
+        # resource and reservation has been released successfully.
         if [[ "$remote_reserved" -eq 1 ]]; then
             kubectl_release_journaled_remote_attempt "$kubernetes_dir" "$lock_fd" \
-                "$KUBECTL_NAMESPACE" "$helper_name" "$generated_attempt_id" || true
+                "$KUBECTL_NAMESPACE" "$helper_name" "$generated_attempt_id" \
+                || rollback_rc=1
         fi
-        [[ -z "${generated_attempt_id:-}" ]] || kubectl_cleanup_journaled_resources \
-            "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" || true
+        [[ -z "$generated_attempt_id" ]] || kubectl_cleanup_journaled_resources \
+            "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" || rollback_rc=1
+        if [[ -n "$generated_attempt_id" \
+                && -f "$kubernetes_dir/attempts/$generated_attempt_id/state.sh" ]]; then
+            kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$generated_attempt_id" >/dev/null 2>&1 \
+                && [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]] \
+                && [[ "$rollback_rc" -eq 0 ]] \
+                && kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" \
+                    "$generated_attempt_id" SUBMISSION_FAILED \
+                || rollback_rc=1
+        fi
+        if [[ "$rollback_rc" -eq 0 && -n "$current_attempt" ]]; then
+            # A cleanly failed resume must not hide its collected predecessor;
+            # a rollback failure deliberately leaves the new PREPARED attempt
+            # as current so status/cancel can retry it.
+            kubectl_attempt_restore_predecessor "$kubernetes_dir" "$lock_fd" \
+                "$generated_attempt_id" || rollback_rc=1
+        fi
         kubectl_local_lock_release "$lock_fd" || true
         return 1
     fi
@@ -2317,16 +2581,10 @@ _kubectl_create_inspector() {
     node=$(_kubectl_attempt_helper_node "$kubernetes_dir/attempts/$attempt_id") || return 1
     token=$(_kubectl_random_hex 4) || return 1
     name="sst-elb-$attempt_id-$template_name-$token"
-    kubectl_create_helper_pod uid "$template_name" "$KUBECTL_NAMESPACE" "$name" \
-        "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$node" "$token" || return 1
     local resource_key="$template_name-$token"
-    kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$attempt_id" \
-        "$resource_key" Pod "$name" "$KUBECTL_NAMESPACE" "$uid" \
-        "$KUBECTL_OWNERSHIP_NONCE" || {
-            kubectl_delete_owned_object Pod "$name" "$KUBECTL_NAMESPACE" \
-                "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$uid" || true
-            return 1
-        }
+    kubectl_create_helper_pod uid "$template_name" "$KUBECTL_NAMESPACE" "$name" \
+        "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$node" "$token" \
+        "$kubernetes_dir" "$lock_fd" "$resource_key" || return 1
     # Every observation has a fresh, journaled identity.  A recovery sweep can
     # delete a helper left by a killed status/collect/cancel process exactly.
     printf -v "$name_output" '%s' "$name"
@@ -2414,7 +2672,8 @@ kubectl_submit_sweep() {
     fi
     if [[ "$rc" -eq 0 ]]; then
         if kubectl_create_owned_object job_uid Job "$job_name" "$KUBECTL_NAMESPACE" \
-                "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$manifest"; then
+                "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$manifest" \
+                "$kubernetes_dir" "$lock_fd" sweep; then
             if ! kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$attempt_id" \
                     sweep Job "$job_name" "$KUBECTL_NAMESPACE" "$job_uid" \
                     "$KUBECTL_OWNERSHIP_NONCE"; then
@@ -2422,6 +2681,9 @@ kubectl_submit_sweep() {
                 # it immediately; later cleanup must never guess by labels.
                 kubectl_delete_owned_object Job "$job_name" "$KUBECTL_NAMESPACE" \
                     "$KUBECTL_OWNERSHIP_NONCE" "$attempt_id" "$job_uid" || true
+                rc=1
+            elif ! kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+                    "$attempt_id" sweep; then
                 rc=1
             elif ! kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" \
                     "$attempt_id" SUBMITTED; then
@@ -2437,18 +2699,31 @@ kubectl_submit_sweep() {
         # Nothing asynchronous is allowed to survive a failed handoff.  The
         # pre-Job lifecycle journal gives this rollback exact identities.
         local rollback_helper="" rollback_uid=""
-        if _kubectl_create_inspector rollback_helper rollback_uid status "$kubernetes_dir" \
-                "$lock_fd" "$attempt_id"; then
-            kubectl_release_journaled_remote_attempt "$kubernetes_dir" "$lock_fd" \
-                "$KUBECTL_NAMESPACE" "$rollback_helper" "$attempt_id" || true
-            _kubectl_remove_inspector "$kubernetes_dir" "$lock_fd" "$rollback_helper" \
-                "$rollback_uid" "$attempt_id" || true
+        local rollback_rc=0
+        if [[ -f "$kubernetes_dir/attempts/$attempt_id/remote-reservation.sh" ]]; then
+            if _kubectl_create_inspector rollback_helper rollback_uid status "$kubernetes_dir" \
+                    "$lock_fd" "$attempt_id"; then
+                kubectl_release_journaled_remote_attempt "$kubernetes_dir" "$lock_fd" \
+                    "$KUBECTL_NAMESPACE" "$rollback_helper" "$attempt_id" \
+                    || rollback_rc=1
+                _kubectl_remove_inspector "$kubernetes_dir" "$lock_fd" "$rollback_helper" \
+                    "$rollback_uid" "$attempt_id" || rollback_rc=1
+            else
+                rollback_rc=1
+            fi
         fi
-        kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" "$attempt_id" || true
+        kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+            || rollback_rc=1
         kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" >/dev/null 2>&1 \
             && [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]] \
+            && [[ "$rollback_rc" -eq 0 ]] \
             && kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" SUBMISSION_FAILED \
-            || true
+            || rollback_rc=1
+        if [[ "$rollback_rc" -eq 0 ]]; then
+            kubectl_attempt_restore_predecessor "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" || rollback_rc=1
+        fi
+        [[ "$rollback_rc" -eq 0 ]] || rc=1
     fi
     kubectl_local_lock_release "$lock_fd" || rc=1
     [[ "$rc" -eq 0 ]] || return "$rc"
@@ -2477,6 +2752,8 @@ kubectl_recover_prepared_attempt() {
         "$attempt_id" || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_attempt_transition "$kubernetes_dir" \
         "$lock_fd" "$attempt_id" SUBMISSION_FAILED || rc=1
+    [[ "$rc" -ne 0 ]] || kubectl_attempt_restore_predecessor "$kubernetes_dir" \
+        "$lock_fd" "$attempt_id" || rc=1
     return "$rc"
 }
 
@@ -2498,6 +2775,13 @@ kubectl_lifecycle_operation() {
         kubectl_emit_state "$collected_terminal"
         [[ "$collected_terminal" == SUCCESS ]]
         return
+    fi
+    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]; then
+        # This repair is local durable state and must not be blocked by a
+        # Kubernetes identity check.  It closes the crash window between
+        # terminalizing a failed resume and restoring its collected parent.
+        kubectl_attempt_restore_predecessor "$kubernetes_dir" "$lock_fd" \
+            "$attempt_id" || rc=1
     fi
     [[ "$rc" -ne 0 ]] || _kubectl_verify_saved_cluster_identity || rc=1
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]; then
@@ -2632,7 +2916,9 @@ _kubectl_merge_collected_results() {
             continue
         fi
         temporary="$parent/.${destination##*/}.collect.${BASHPID:-$$}.${RANDOM}"
-        if ! cp -- "$source" "$temporary" || ! mv -n -- "$temporary" "$destination"; then
+        if ! cp -- "$source" "$temporary" \
+                || ! mv -n -- "$temporary" "$destination" \
+                || [[ -e "$temporary" ]]; then
             rm -f -- "$temporary"
             return 1
         fi

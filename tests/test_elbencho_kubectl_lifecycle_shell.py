@@ -86,6 +86,15 @@ def test_local_lifecycle_state_graph_and_symlink_state_are_rejected(
     assert result.returncode == 0, result.stderr
 
 
+def test_local_path_validator_checks_suffix_after_missing_component(
+    tmp_path: Path,
+) -> None:
+    """A missing prefix cannot hide a later parent-directory component."""
+    requested = tmp_path / "future" / ".." / "outside"
+    result = _bash(f"! _kubectl_validate_local_directory_path {str(requested)!r}")
+    assert result.returncode == 0, result.stderr
+
+
 def test_attempt_templates_are_yaml_and_restrict_security_surface() -> None:
     """The checked-in resources have no API token, host networking, or Service."""
     result = _bash("""
@@ -638,6 +647,75 @@ def test_pvc_path_validator_defends_reserved_tree_and_future_parent() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_remote_control_tree_guard_checks_realpath_and_symlink_containment() -> None:
+    """Every remote mutation shares the same reserved-run containment guard."""
+    result = _bash("""
+        guard=$(kubectl_remote_tree_guard_script)
+        [[ "$guard" == *'realpath -e -- "$mount"'* ]]
+        [[ "$guard" == *'[[ -d "$run" && ! -L "$run" ]]'* ]]
+        [[ "$guard" == *'[[ "$run_real" == "$root_real/runs/$attempt" ]]'* ]]
+        """)
+    assert result.returncode == 0, result.stderr
+    source = _FUNCTIONS.read_text(encoding="utf-8")
+    for function in (
+        "kubectl_initialize_remote_control_tree",
+        "kubectl_upload_control_bundle",
+        "kubectl_record_remote_status",
+        "kubectl_stream_remote_attempt",
+        "kubectl_recover_lost_coordinator",
+        "kubectl_finalize_cancelled_attempt",
+    ):
+        body = source.split(f"{function}() {{", 1)[1].split("\n}", 1)[0]
+        assert "kubectl_remote_tree_guard_script" in body, function
+    assert source.count('-f "$lock/owner"') >= 2
+    assert source.count('! -L "$lock/owner"') >= 2
+
+
+def test_runtime_preflight_covers_complete_coordinator_command_contract() -> None:
+    """The runtime image check names every external coordinator dependency."""
+    source = _FUNCTIONS.read_text(encoding="utf-8")
+    body = source.split("kubectl_validate_runtime_pod() {", 1)[1].split(
+        "\n}\n\nkubectl_discover_candidate_nodes", 1
+    )[0]
+    for command in (
+        "elbencho",
+        "bash",
+        "tar",
+        "realpath",
+        "timeout",
+        "sha256sum",
+        "awk",
+        "find",
+        "grep",
+        "mkdir",
+        "cp",
+        "cmp",
+        "date",
+        "shuf",
+        "mv",
+        "wc",
+        "cat",
+        "sed",
+        "rm",
+        "sort",
+        "basename",
+        "dirname",
+        "sleep",
+        "mktemp",
+        "tr",
+        "xargs",
+        "rmdir",
+        "id",
+        "cut",
+        "od",
+    ):
+        assert command in body, command
+    assert "type -P stat" in body
+    assert "type -P gstat" in body
+    assert "type -P pkill" in body
+    assert "type -P killall" in body
+
+
 def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:
     """The trusted helper, coordinator, and frozen run metadata stay together."""
     coordinator = tmp_path / "coordinator-source.sh"
@@ -784,6 +862,37 @@ def test_remote_reservation_release_is_journaled_in_retryable_steps(
     assert result.returncode == 0, result.stderr
 
 
+def test_remote_release_executes_guards_before_owner_read_and_deletion(
+    tmp_path: Path,
+) -> None:
+    """Release rejects symlinked owners while allowing an owned tree to clean up."""
+    mount = tmp_path / "mount"
+    result = _bash(f"""
+        mount={str(mount)!r}
+        root="$mount/.storage-scale-test"
+        lock="$root/locks/kubernetes-elbencho-sweep"
+        run="$root/runs/1234abcd"
+        nonce=0123456789abcdef0123456789abcdef
+        mkdir -p "$lock" "$run"
+        printf '1234abcd\\t%s\\n' "$nonce" > "$lock/owner"
+        kubectl_pvc_exec() {{
+            script="$5"
+            script=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$script")
+            lock_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$7")
+            run_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$8")
+            bash -ceu "$script" bash "$lock_arg" "$run_arg" "$9" "${{10}}"
+        }}
+        kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
+        [[ ! -e "$lock" && ! -e "$run" ]]
+
+        mkdir -p "$lock" "$run" "$mount/outside"
+        ln -s "$mount/outside/owner" "$lock/owner"
+        ! kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
+        [[ -L "$lock/owner" && -d "$run" ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("failed_stage", ("release", "cleanup", "remove"))
 def test_collection_recovery_retries_every_cleanup_stage(
     tmp_path: Path, failed_stage: str
@@ -845,7 +954,12 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         events={str(tmp_path / 'events')!r}
         kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
-        kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\nnode-b\\tuid-b\\tamd64\\n' > "$2"; printf nodes >> "$events"; }}
+        kubectl_discover_candidate_nodes() {{
+            test -s {str(tmp_path)!r}/kubernetes/current-attempt
+            printf current >> "$events"
+            printf 'node-a\\tuid-a\\tamd64\\nnode-b\\tuid-b\\tamd64\\n' > "$2"
+            printf nodes >> "$events"
+        }}
         kubectl_choose_coordinator_node() {{ printf 'node-a\\n'; }}
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; printf helper >> "$events"; }}
         kubectl_validate_pvc_paths() {{ printf paths >> "$events"; }}
@@ -861,7 +975,295 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
         [[ "$attempt" =~ ^[0-9a-f]{{8}}$ ]]
         test -f {str(tmp_path)!r}/kubernetes/attempts/"$attempt"/identity.sh
         test -f {str(tmp_path)!r}/kubernetes/attempts/"$attempt"/configuration.sh
-        [[ $(cat "$events") == nodeshelperpathsjournalreserveacquiredinitializepolicyworkersendpoints ]]
+        [[ $(cat "$events") == currentnodeshelperpathsjournalreserveacquiredinitializepolicyworkersendpoints ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_prepare_failure_terminalizes_only_after_successful_rollback(
+    tmp_path: Path,
+) -> None:
+    """A failed pre-Job handoff becomes SUBMISSION_FAILED after exact cleanup."""
+    result = _bash(f"""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        events={str(tmp_path / 'events')!r}
+        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_validate_pvc_paths() {{ :; }}
+        kubectl_attempt_journal_remote_reservation() {{ :; }}
+        kubectl_reserve_remote_attempt() {{ :; }}
+        kubectl_attempt_mark_remote_reservation_acquired() {{ :; }}
+        kubectl_initialize_remote_control_tree() {{ :; }}
+        kubectl_create_attempt_policies() {{ printf policies >> "$events"; return 1; }}
+        kubectl_release_journaled_remote_attempt() {{ printf release >> "$events"; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; }}
+        attempt=
+        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 mapped
+        attempt=$(cat {str(tmp_path)!r}/kubernetes/current-attempt)
+        kubectl_attempt_load_metadata {str(tmp_path)!r}/kubernetes/attempts/"$attempt"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+        [[ $(cat "$events") == policiesreleasecleanup ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
+    tmp_path: Path,
+) -> None:
+    """A failed release leaves the durable PREPARED pointer for retry."""
+    result = _bash(f"""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        events={str(tmp_path / 'events')!r}
+        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_validate_pvc_paths() {{ :; }}
+        kubectl_attempt_journal_remote_reservation() {{ :; }}
+        kubectl_reserve_remote_attempt() {{ :; }}
+        kubectl_attempt_mark_remote_reservation_acquired() {{ :; }}
+        kubectl_initialize_remote_control_tree() {{ :; }}
+        kubectl_create_attempt_policies() {{ printf policies >> "$events"; return 1; }}
+        kubectl_release_journaled_remote_attempt() {{ printf release >> "$events"; return 1; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; }}
+        attempt=
+        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 mapped
+        attempt=$(cat {str(tmp_path)!r}/kubernetes/current-attempt)
+        kubectl_attempt_load_metadata {str(tmp_path)!r}/kubernetes/attempts/"$attempt"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]
+        [[ $(cat "$events") == policiesreleasecleanup ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_submission_failure_terminalizes_only_after_successful_rollback(
+    tmp_path: Path,
+) -> None:
+    """Submit rollback records SUBMISSION_FAILED only after cleanup succeeds."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        events={str(tmp_path / 'events')!r}
+        kubectl_validate_runtime_configuration() {{ :; }}
+        kubectl_map_test_dirs() {{ :; }}
+        kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
+        kubectl_prepare_control_bundle() {{ return 1; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; }}
+        ! kubectl_submit_sweep {str(results)!r} 1
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+        [[ $(cat "$events") == cleanup ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_submission_rollback_failure_keeps_prepared_attempt_recoverable(
+    tmp_path: Path,
+) -> None:
+    """A failed submit cleanup leaves current-attempt recoverable as PREPARED."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        events={str(tmp_path / 'events')!r}
+        kubectl_validate_runtime_configuration() {{ :; }}
+        kubectl_map_test_dirs() {{ :; }}
+        kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
+        kubectl_prepare_control_bundle() {{ return 1; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; return 1; }}
+        ! kubectl_submit_sweep {str(results)!r} 1
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]
+        [[ $(cat "$events") == cleanup ]]
+        [[ $(kubectl_attempt_current_id "$root") == 1234abcd ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_clean_failed_resume_restores_collected_predecessor_pointer(
+    tmp_path: Path,
+) -> None:
+    """A clean B rollback leaves collected A discoverable for the next resume."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
+        kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
+        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_validate_pvc_paths() {{ :; }}
+        kubectl_attempt_journal_remote_reservation() {{ :; }}
+        kubectl_reserve_remote_attempt() {{ :; }}
+        kubectl_attempt_mark_remote_reservation_acquired() {{ :; }}
+        kubectl_initialize_remote_control_tree() {{ :; }}
+        kubectl_create_attempt_policies() {{ return 1; }}
+        kubectl_release_journaled_remote_attempt() {{ :; }}
+        kubectl_cleanup_journaled_resources() {{ :; }}
+        first=
+        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped '' 1234abcd
+        [[ $(kubectl_attempt_current_id "$root") == 1234abcd ]]
+        kubectl_attempt_load_metadata "$root/attempts/aaaabbbb"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_deferred_prepared_recovery_restores_collected_predecessor_pointer(
+    tmp_path: Path,
+) -> None:
+    """Later PREPARED recovery also restores A after B rollback eventually succeeds."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
+        kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
+        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_validate_pvc_paths() {{ :; }}
+        kubectl_attempt_journal_remote_reservation() {{ :; }}
+        kubectl_reserve_remote_attempt() {{ :; }}
+        kubectl_attempt_mark_remote_reservation_acquired() {{ :; }}
+        kubectl_initialize_remote_control_tree() {{ :; }}
+        kubectl_create_attempt_policies() {{ return 1; }}
+        kubectl_release_journaled_remote_attempt() {{ return 1; }}
+        kubectl_cleanup_journaled_resources() {{ :; }}
+        first=
+        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped '' 1234abcd
+        [[ $(kubectl_attempt_current_id "$root") == aaaabbbb ]]
+        kubectl_local_lock_acquire "$root" fd2
+        kubectl_recover_prepared_attempt "$root" "$fd2" aaaabbbb
+        [[ $(kubectl_attempt_current_id "$root") == 1234abcd ]]
+        kubectl_attempt_load_metadata "$root/attempts/aaaabbbb"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+        kubectl_local_lock_release "$fd2"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_submission_failed_status_retries_predecessor_restore(tmp_path: Path) -> None:
+    """A terminal failed resume still repairs current-attempt on status."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        kubectl_local_lock_acquire "$root" fd2
+        kubectl_attempt_create_identity "$root" "$fd2" aaaabbbb \\
+          11111111111111111111111111111111 test-ns namespace-uid \\
+          test-pv pv-uid test-pvc pvc-uid
+        kubectl_attempt_write_state "$root" "$fd2" aaaabbbb PREPARED
+        kubectl_attempt_transition "$root" "$fd2" aaaabbbb SUBMISSION_FAILED
+        printf '1234abcd\\n' > "$root/attempts/aaaabbbb/predecessor-attempt"
+        : > "$root/attempts/aaaabbbb/configuration.sh"
+        kubectl_attempt_write_current "$root" "$fd2" aaaabbbb
+        kubectl_local_lock_release "$fd2"
+        # Even if cluster identity validation is unavailable, local recovery
+        # must repair the pointer before returning the error.
+        _kubectl_verify_saved_cluster_identity() {{ return 1; }}
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        kubectl_emit_state() {{ printf '%s\\n' "$1"; }}
+        ! kubectl_lifecycle_operation status {str(results)!r}
+        [[ $(cat "$root/current-attempt") == 1234abcd ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_creation_intent_cleans_object_left_before_resource_journal(
+    tmp_path: Path,
+) -> None:
+    """Rollback discovers and deletes an object whose UID journal was interrupted."""
+    result = _bash(
+        _identity(tmp_path / "state")
+        + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd transfer \
+          Pod helper test-ns 0123456789abcdef0123456789abcdef
+        events="""
+        + str(tmp_path / "events")
+        + """
+        kubectl_run_bounded() { printf uid-1; }
+        kubectl_verify_object_identity() { :; }
+        kubectl_delete_owned_object() { printf delete >> "$events"; }
+        kubectl_cleanup_journaled_resources "$root" "$fd" 1234abcd
+        [[ $(cat "$events") == delete ]]
+        [[ ! -e "$root/attempts/1234abcd/creation-intents/transfer.sh" ]]
+        ln -s /missing "$root/attempts/1234abcd/creation-intents/tampered.sh"
+        ! kubectl_cleanup_journaled_resources "$root" "$fd" 1234abcd
+        [[ -L "$root/attempts/1234abcd/creation-intents/tampered.sh" ]]
+        kubectl_local_lock_release "$fd"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_no_clobber_journals_remove_unpublished_temporary_files(
+    tmp_path: Path,
+) -> None:
+    """A no-clobber collision fails without leaving attacker-shaped debris."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_predecessor "$root" "$fd" 1234abcd aaaabbbb
+        ! kubectl_attempt_write_predecessor "$root" "$fd" 1234abcd ccccdddd
+        ! compgen -G "$root/attempts/1234abcd/predecessor-attempt.tmp.*" >/dev/null
+
+        mv() {
+          if [[ "${*: -1}" == "$root/attempts/1234abcd/creation-intents/transfer.sh" ]]; then
+            return 0
+          fi
+          command mv "$@"
+        }
+        ! kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd transfer \
+          Pod helper test-ns 0123456789abcdef0123456789abcdef
+        ! compgen -G \
+          "$root/attempts/1234abcd/creation-intents/transfer.sh.tmp.*" >/dev/null
         """)
     assert result.returncode == 0, result.stderr
 

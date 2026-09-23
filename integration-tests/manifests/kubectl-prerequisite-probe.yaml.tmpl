@@ -121,7 +121,7 @@ spec:
           command -v timeout >/dev/null
           perl -MIO::Socket::INET -e 1
           probe_root=/tmp/storage-scale-kubectl-probe
-          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /200/ ? 0 : 1);'
+          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /\AHTTP\/[0-9.]+ 200(?:[ \t]|\r?\n)/ ? 0 : 1);'
           umask 077
           mkdir -m 0700 -- "$probe_root"
           shopt -s nullglob
@@ -201,7 +201,7 @@ spec:
           command -v timeout >/dev/null
           perl -MIO::Socket::INET -e 1
           probe_root=/tmp/storage-scale-kubectl-probe
-          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /200/ ? 0 : 1);'
+          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /\AHTTP\/[0-9.]+ 200(?:[ \t]|\r?\n)/ ? 0 : 1);'
           umask 077
           mkdir -m 0700 -- "$probe_root"
           shopt -s nullglob

@@ -830,6 +830,7 @@ _coordinator_recover_lost() {
     _coordinator_initialize_snapshots "$allow_startup_repair" || return 1
     _coordinator_initialize_execution_states "$allow_startup_repair" || return 1
     local status_file id status failed_id="" first_pending="" changed=0
+    local terminal_failed_id="" recovery_terminal recovery_exit_code
     local execution_observed_status=""
     for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
         [[ -f "$status_file" && ! -L "$status_file" ]] || continue
@@ -844,33 +845,58 @@ _coordinator_recover_lost() {
                 changed=1
                 ;;
             PENDING) [[ -n "$first_pending" ]] || first_pending="$id" ;;
-            SUCCESS|FAILED) ;;
+            SUCCESS) ;;
+            FAILED)
+                [[ -n "$terminal_failed_id" ]] || terminal_failed_id="$id"
+                ;;
             *) _coordinator_error "invalid execution state during recovery: $id=$status"; return 1 ;;
         esac
     done
     if [[ "$changed" -eq 0 ]]; then
-        [[ -n "$first_pending" ]] || {
-            _coordinator_error "lost-coordinator recovery found no resumable execution"
-            return 1
-        }
-        failed_id="$first_pending"
-        execution_observed_status=PENDING
-        _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.status" FAILED || return 1
-        _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.exitcode" 143 || return 1
+        if [[ -n "$terminal_failed_id" ]]; then
+            # A failed cell may be followed by pending cells when the
+            # coordinator dies after that cell's terminal checkpoint. Keep
+            # the original failure and leave those cells resumable.
+            failed_id="$terminal_failed_id"
+            execution_observed_status=FAILED
+            recovery_terminal=FAILED
+            recovery_exit_code=$(cat "$STATE_DIR/executions/$failed_id.exitcode" \
+                2>/dev/null || printf '1')
+            [[ "$recovery_exit_code" =~ ^[0-9]+$ && "$recovery_exit_code" -ne 0 ]] \
+                || recovery_exit_code=1
+        elif [[ -n "$first_pending" ]]; then
+            failed_id="$first_pending"
+            execution_observed_status=PENDING
+            _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.status" FAILED || return 1
+            _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.exitcode" 143 || return 1
+            recovery_terminal=FAILED
+            recovery_exit_code=143
+        else
+            # A coordinator can die after the final cell has durably
+            # published its terminal state but before it publishes the
+            # attempt manifest. There is no work left to mark failed: derive
+            # the result from the durable execution ledger and publish it now.
+            execution_observed_status=SUCCESS
+            recovery_terminal=SUCCESS
+            recovery_exit_code=0
+        fi
+    else
+        recovery_terminal=FAILED
+        recovery_exit_code=143
     fi
     local recovery_tmp="$STATE_DIR/.coordinator-loss.tmp.${BASHPID:-$$}.${RANDOM}"
     {
         printf 'schema\t1\n'
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
-        printf 'execution\t%s\n' "$failed_id"
+        printf 'execution\t%s\n' "${failed_id:-none}"
         printf 'observed_status\t%s\n' "$observed_run_status"
         printf 'execution_observed_status\t%s\n' "$execution_observed_status"
-        printf 'recovered_status\tFAILED\n'
-        printf 'exit_code\t143\n'
+        printf 'recovered_status\t%s\n' "$recovery_terminal"
+        printf 'exit_code\t%s\n' "$recovery_exit_code"
     } > "$recovery_tmp" \
         && mv -f -- "$recovery_tmp" "$STATE_DIR/coordinator-loss.tsv" || return 1
-    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || return 1
-    _coordinator_write_summary FAILED "$failed_id" 143 || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" "$recovery_terminal" || return 1
+    _coordinator_write_summary "$recovery_terminal" "$failed_id" "$recovery_exit_code" || return 1
     _coordinator_publish_manifest
 }
 
