@@ -776,6 +776,7 @@ def _override_block(
     data = "/mnt/storage-test"
     lines = [
         "# Bounded integration regression overrides.",
+        f"export EXECUTION_SUBSTRATE={_shell(selector)}",
         f"export RESULTS_DIR={_shell(results_dir or remote_root + '/results')}",
         f"export LOGS_DIR={_shell(logs_dir or remote_root + '/logs')}",
         "ORDER_NODES=1",

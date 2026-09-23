@@ -1382,6 +1382,8 @@ write_elbencho_env_used() {
         printf '# env_used.yaml - elbencho sweep configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
+
         printf 'TEST_DIRS:\n'
         local _path
         for _path in "${!TEST_DIRS[@]}"; do
@@ -1495,6 +1497,8 @@ _write_elbencho_env_used_sh() {
         printf '# Auto-generated. The companion env_used.yaml is the human/external-tool form.\n'
         printf '# This file is the canonical artifact for nv-elbencho-sweep.sh --resume.\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+        printf 'export EXECUTION_SUBSTRATE=%q\n\n' "${EXECUTION_SUBSTRATE:?}"
 
         _emit_bash_test_dirs_decl
         printf '\n'
@@ -1655,6 +1659,8 @@ write_mdtest_elbencho_env_used() {
     {
         printf '# env_used.yaml - mdtest-elbencho configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
 
         printf 'TEST_DIRS:\n'
         local _path

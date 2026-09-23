@@ -1178,6 +1178,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         ELBENCHO_SINGLE_BIG_FILE_BASENAME=elbencho-bigfile
         ELBENCHO_SINGLE_BIG_FILE_SIZE=
         ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
+        EXECUTION_SUBSTRATE=slurm
         write_elbencho_env_used "$output_dir/env_used.yaml" dio 0 0 0 0 "$tmp/read-from" 1
         printf '2026-08-17T00:00:00Z\\thit\\treused\\t%s\\n' \\
             "$tmp/read-from/.storage-scale-test-elbencho-treefile.txt" \\
@@ -1509,6 +1510,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             ELBENCHO_FILE_LAYOUT=shared-directory
@@ -1577,6 +1579,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             ELBENCHO_FILE_LAYOUT=worker-directories
@@ -1650,6 +1653,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
             RESULTS_DIR=__RESULTS_DIR__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             declare -gA TEST_DIRS=([/tmp/fs]=1)
