@@ -93,6 +93,10 @@ requirements files; never treat ambient Python tooling as authoritative.
   prefer a local checkout at `tmp/elbencho-src` when present over web snippets.
 - **Python**: keep each function's cognitive complexity <= 15 (not linter-enforced);
   avoid duplicating a literal string 3+ times (use a constant). `pylint` 10.00/10.
+- **Kubernetes probe diagnosis**: `kubectl exec` returning `-9` does not prove
+  OOM or broken Pod networking. Check OOM evidence, then run the socket operation
+  from a Pod-resident script. If only exec-carried socket code is killed, keep
+  network I/O in the Pod and use exec for bounded request/result transfer.
 - Don't restate rules the linters already enforce; rely on `black`/`pylint`/`shellcheck`.
 
 ## Pull requests

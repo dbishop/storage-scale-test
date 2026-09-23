@@ -207,6 +207,24 @@ def _run_recovery(control, state_dir, scratch):
     )
 
 
+def test_endpoint_probe_runs_socket_code_from_the_coordinator_file():
+    """The bounded child does not carry socket code as inline shell text."""
+    source = _COORDINATOR.read_text(encoding="utf-8")
+    wrapper = source.split("_coordinator_probe_endpoint() {", maxsplit=1)[1].split(
+        "_coordinator_probe_endpoint_request() {", maxsplit=1
+    )[0]
+    assert 'bash "$0" --probe-endpoint "$endpoint"' in wrapper
+    assert "/dev/tcp" not in wrapper
+    rejected = subprocess.run(
+        [_BASH, str(_COORDINATOR), "--probe-endpoint", "999.10.0.1"],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+
+
 def test_coordinator_uses_verified_bundle_context_and_manifest_last(tmp_path):
     """Only the durable manifest exposes both fully committed fake cells."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path)

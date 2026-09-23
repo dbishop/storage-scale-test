@@ -892,6 +892,46 @@ def test_nfs_server_configures_eight_workers(tmp_path, monkeypatch):
     assert _DRIVER.NFS_SERVER_THREADS == 8
 
 
+def test_nfs_setup_rejects_another_active_v4_root(tmp_path):
+    """A second NFSv4 root cannot silently redirect fixture mounts."""
+    # pylint: disable=protected-access
+
+    class _ExportRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "/srv/unrelated\n"
+                    "\t\t172.18.0.0/16(sync,fsid=root,rw)\n"
+                    f"{tmp_path / 'expected'}\n"
+                    "\t\t172.18.0.0/16(sync,fsid=0,rw)\n"
+                ),
+                stderr="",
+            )
+
+    with pytest.raises(_DRIVER.ProvisionError, match="redirect CSI mounts"):
+        _DRIVER._assert_no_conflicting_nfs_v4_root(
+            _ExportRunner(), tmp_path / "expected"
+        )
+
+
+def test_nfs_setup_accepts_its_own_active_v4_root(tmp_path):
+    """Repeated setup accepts the already-active owned root export."""
+    # pylint: disable=protected-access
+
+    class _ExportRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{tmp_path / 'expected'}\n" "\t\t172.18.0.0/16(sync,fsid=0,rw)\n"
+                ),
+                stderr="",
+            )
+
+    _DRIVER._assert_no_conflicting_nfs_v4_root(_ExportRunner(), tmp_path / "expected")
+
+
 def test_nfs_reconciliation_validates_previous_subnet_before_update(
     tmp_path, monkeypatch
 ):
@@ -3256,6 +3296,15 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
             assert container["securityContext"]["allowPrivilegeEscalation"] is False
             assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
             assert "hostPort" not in str(container)
+    for client in (coordinator, denied):
+        client_script = client["spec"]["containers"][0]["args"][0]
+        assert "command -v timeout >/dev/null" in client_script
+        assert "perl -MIO::Socket::INET -e 1" in client_script
+        assert "probe_root=/tmp/storage-scale-kubectl-probe" in client_script
+        assert "timeout --kill-after=1s 5s" in client_script
+        assert "use IO::Socket::INET" in client_script
+        assert "PeerPort=>1611" in client_script
+        assert client["spec"]["containers"][0]["readinessProbe"]["exec"]
     worker = daemonset["spec"]["template"]["spec"]["containers"][0]
     worker_script = worker["args"][0]
     assert (
@@ -3296,6 +3345,84 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
         ]
         == "worker"
     )
+
+
+def test_kubectl_probe_status_detaches_network_io_from_exec(monkeypatch, tmp_path):
+    """Cross-Pod socket lifetime is not coupled to a kubectl exec stream."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    calls = []
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+
+    def _probe_exec(_runner, _config_value, pod, container, arguments, **kwargs):
+        calls.append((pod, container, tuple(arguments), kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(
+        _DRIVER.secrets, "token_hex", lambda _length: "0123456789abcdef"
+    )
+    monkeypatch.setattr(_DRIVER, "_kubectl_probe_exec", _probe_exec)
+
+    result = _DRIVER._kubectl_probe_status(
+        object(), config, "coordinator", "coordinator", "10.244.1.2"
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 4
+    launch = calls[0][2]
+    assert launch[:2] == ("bash", "-ceu")
+    assert "/dev/tcp" not in launch[2]
+    assert launch[4:7] == (
+        "/tmp/storage-scale-kubectl-probe",
+        "0123456789abcdef",
+        "10.244.1.2",
+    )
+    assert calls[-1][2] == (
+        "rm",
+        "-rf",
+        "--",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef.request",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef.request.tmp",
+    )
+
+
+def test_kubectl_probe_status_preserves_detached_failure(monkeypatch, tmp_path):
+    """A denied detached request remains an ordinary nonzero probe result."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "124\n", ""),
+            subprocess.CompletedProcess([], 0, "timed out\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_kubectl_probe_exec",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = _DRIVER._kubectl_probe_status(
+        object(),
+        config,
+        "denied",
+        "denied",
+        "10.244.2.2",
+        check=False,
+    )
+
+    assert result.returncode == 124
+    assert result.stderr == "timed out\n"
 
 
 def _yaml_image_references(value):

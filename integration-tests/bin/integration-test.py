@@ -1903,9 +1903,35 @@ def _ensure_export_filesystem(runner: Runner, config: Config) -> None:
     _validate_nfs_filesystem_capacity(runner, config)
 
 
+def _assert_no_conflicting_nfs_v4_root(runner: Runner, export_dir: Path) -> None:
+    """Reject an active NFSv4 root that can redirect fixture clients."""
+    result = runner.run(
+        [*_sudo_prefix(), "exportfs", "-v"],
+        check=False,
+        timeout=30,
+    )
+    if result.returncode:
+        raise ProvisionError("cannot inspect active NFS exports before setup")
+    current_path = ""
+    roots = []
+    for line in result.stdout.splitlines():
+        if line and not line[0].isspace():
+            current_path = line.strip()
+        elif current_path and re.search(r"(?:^|[,(])fsid=(?:0|root)(?:[,)]|$)", line):
+            roots.append(current_path)
+    expected = os.path.normpath(str(export_dir))
+    conflicts = sorted({path for path in roots if os.path.normpath(path) != expected})
+    if conflicts:
+        raise ProvisionError(
+            "another active NFSv4 root export would redirect CSI mounts away "
+            f"from {export_dir}: {', '.join(conflicts)}"
+        )
+
+
 def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) -> None:
     """Reconcile the narrow NFSv4 export and firewall rule."""
     LOG.info("Configuring NFSv4 export for kind subnet %s", subnet)
+    _assert_no_conflicting_nfs_v4_root(runner, config.export_dir)
     _record_nfs_service_state(runner, config)
     _ensure_export_filesystem(runner, config)
     _ensure_export_marker(runner, config)
@@ -3630,21 +3656,106 @@ def _kubectl_probe_status(
 ) -> subprocess.CompletedProcess[str]:
     """Query one Elbencho service directly by numeric Pod IPv4 address."""
     ipaddress.IPv4Address(address)
-    script = (
-        'exec 3<>/dev/tcp/"$1"/1611; '
-        "printf 'GET /status HTTP/1.0\\r\\nHost: %s:1611\\r\\n\\r\\n' "
-        '"$1" >&3; IFS= read -r -t 5 response <&3; exec 3>&-; '
-        '[[ "$response" == *" 200 "* ]]'
+    operation = secrets.token_hex(8)
+    remote_root = f"/tmp/{KUBECTL_PROBE_NAME}"
+    remote_dir = f"{remote_root}/{operation}"
+    trigger_script = (
+        'root="$1"; operation="$2"; address="$3"; '
+        '[[ "$operation" =~ ^[0-9a-f]{16}$ && -d "$root" '
+        '&& ! -e "$root/$operation" && ! -e "$root/$operation.request" ]]; '
+        'tmp="$root/$operation.request.tmp"; '
+        'printf "%s\\n" "$address" > "$tmp"; '
+        'mv -n -- "$tmp" "$root/$operation.request"'
     )
-    return _kubectl_probe_exec(
+    _kubectl_probe_exec(
         runner,
         config,
         pod,
         container,
-        ("timeout", "5s", "bash", "-ceu", script, "bash", address),
-        check=check,
-        timeout=15,
+        (
+            "bash",
+            "-ceu",
+            trigger_script,
+            "bash",
+            remote_root,
+            operation,
+            address,
+        ),
+        timeout=10,
     )
+    deadline = time.monotonic() + 10
+    result_code: int | None = None
+    stderr = ""
+    try:
+        while time.monotonic() < deadline:
+            result = _kubectl_probe_exec(
+                runner,
+                config,
+                pod,
+                container,
+                (
+                    "bash",
+                    "-ceu",
+                    'test -f "$1/rc" && cat -- "$1/rc"',
+                    "bash",
+                    remote_dir,
+                ),
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                value = result.stdout.strip()
+                if value.isdigit() and 0 <= int(value) <= 255:
+                    result_code = int(value)
+                    break
+                raise ProvisionError(
+                    f"invalid kubectl prerequisite probe result for {address}: {value!r}"
+                )
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        if result_code is None:
+            raise ProvisionError(
+                f"kubectl prerequisite probe did not finish for {address}"
+            )
+        error_result = _kubectl_probe_exec(
+            runner,
+            config,
+            pod,
+            container,
+            ("cat", "--", f"{remote_dir}/stderr"),
+            check=False,
+            timeout=5,
+        )
+        stderr = error_result.stdout
+    finally:
+        _kubectl_probe_exec(
+            runner,
+            config,
+            pod,
+            container,
+            (
+                "rm",
+                "-rf",
+                "--",
+                remote_dir,
+                f"{remote_root}/{operation}.request",
+                f"{remote_root}/{operation}.request.tmp",
+            ),
+            check=False,
+            timeout=5,
+        )
+    completed = subprocess.CompletedProcess(
+        args=["kubectl-prerequisite-probe", address],
+        returncode=result_code,
+        stdout="",
+        stderr=stderr,
+    )
+    if check and completed.returncode:
+        detail = _failure_detail(completed.stdout, completed.stderr, False)
+        raise ProvisionError(
+            f"kubectl prerequisite probe failed ({completed.returncode}) for "
+            f"{address}{detail}"
+        )
+    return completed
 
 
 def _wait_for_kubectl_probe_denial(

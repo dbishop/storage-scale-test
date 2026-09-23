@@ -302,13 +302,20 @@ _coordinator_validate_endpoint_rows() {
 
 _coordinator_probe_endpoint() {
     local endpoint="$1"
-    # shellcheck disable=SC2016  # $1 and $response belong to the inner Bash.
-    timeout --kill-after=2s 5s bash -c '
-        exec 3<>"/dev/tcp/$1/1611"
-        printf "GET /status HTTP/1.0\\r\\nHost: %s:1611\\r\\n\\r\\n" "$1" >&3
-        IFS= read -r response <&3
-        [[ "$response" == *" 200 "* ]]
-    ' bash "$endpoint"
+    # Keep socket code in this file. Some constrained hosts terminate socket
+    # programs carried as inline shell text even though ordinary Pod traffic
+    # is allowed.
+    timeout --kill-after=2s 5s bash "$0" --probe-endpoint "$endpoint"
+}
+
+_coordinator_probe_endpoint_request() {
+    local endpoint="$1" response
+    _coordinator_valid_ipv4 "$endpoint" || return 1
+    exec 3<>"/dev/tcp/$endpoint/1611"
+    printf 'GET /status HTTP/1.0\r\nHost: %s:1611\r\n\r\n' "$endpoint" >&3
+    IFS= read -r response <&3
+    exec 3>&-
+    [[ "$response" == *" 200 "* ]]
 }
 
 _coordinator_health_hook() {
@@ -1030,6 +1037,15 @@ if [[ "${1:-}" == --select-collected-resume ]]; then
         exit 1
     }
     _coordinator_select_collected_resume "$2"
+    exit $?
+fi
+
+if [[ "${1:-}" == --probe-endpoint ]]; then
+    [[ "$#" -eq 2 ]] || {
+        _coordinator_error "usage: $KUBECTL_COORDINATOR_BASENAME --probe-endpoint IPV4"
+        exit 1
+    }
+    _coordinator_probe_endpoint_request "$2"
     exit $?
 fi
 
