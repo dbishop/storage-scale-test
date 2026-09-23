@@ -18,11 +18,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -47,6 +49,7 @@ from failure_injection import (
     staged_failure_injection,
 )
 from fixture_images import ELBENCHO_UPSTREAM_IMAGE
+from fixture_images import ELBENCHO_FIXTURE_IMAGE
 from fixture_capacity import (
     MAX_DEPLOYMENT_CONTENT_BYTES,
     MAX_LIVE_CAPTURE_DATASET_BYTES,
@@ -93,6 +96,14 @@ ELBENCHO_ARCHIVES = {
 }
 REMOTE_BASE = "/mnt/storage-test/integration-regression"
 SSH_FAILURE_STAGING_BASE = "/tmp/storage-scale-test-integration-failure"
+KUBECTL_UTILITY_PREFIX = "storage-scale-test-utility"
+KUBECTL_TARGET_SELECTOR = "storage-scale-test/target=true"
+KUBECTL_STORAGE_PVC = "storage-test-rwx"
+KUBECTL_STORAGE_MOUNT = "/mnt/storage-scale-test"
+KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
+KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
+    {"PREPARED", "SUBMITTED", "RUNNING"}
+)
 VALIDATION_SUCCESS = "All validation checks passed successfully"
 WORKLOAD_USER = "tester"
 WORKLOAD_UID = 2000
@@ -107,14 +118,19 @@ class IntegrationTestError(RuntimeError):
 class Fixture:
     """Live fixture details discovered from Kubernetes and Slurm."""
 
-    login_pod: str
-    login_container: str
+    login_pod: str | None
+    login_container: str | None
     ssh_addresses: tuple[str, ...]
     slurm_nodes: tuple[str, ...]
     slurm_addresses: tuple[str, ...]
     architecture: str
     ssh_home_mode: str
     storage_backend: str
+    kubectl_nodes: tuple[str, ...]
+    kubectl_namespace: str
+    kubectl_pv: str
+    kubectl_pvc: str
+    kubectl_image: str
 
 
 @dataclass
@@ -253,8 +269,8 @@ def _load_state(config: Any) -> dict[str, Any]:
     return state
 
 
-def _require_nodes(runner: Any, config: Any) -> None:
-    """Require the exact ready three-node topology and labels."""
+def _require_nodes(runner: Any, config: Any) -> list[dict[str, Any]]:
+    """Return the exact ready three-node topology and labels."""
     clusters = runner.run(["kind", "get", "clusters"], timeout=30).stdout.split()
     if config.cluster_name not in clusters:
         raise IntegrationTestError(
@@ -284,21 +300,32 @@ def _require_nodes(runner: Any, config: Any) -> None:
         raise IntegrationTestError(
             f"node label invariant failed: target={target}, login={login}"
         )
+    return nodes
 
 
-def _require_storage(runner: Any, config: Any) -> None:
-    """Require both integration PVCs to be bound."""
+def _require_storage(runner: Any, config: Any) -> tuple[str, str]:
+    """Require bound integration PVCs and return the data PV/PVC names."""
     result = runner.run(
         _kubectl(config, "-n", config.namespace, "get", "pvc", "-o", "json"),
         timeout=30,
     )
     claims = {
-        item["metadata"]["name"]: item.get("status", {}).get("phase")
-        for item in json.loads(result.stdout)["items"]
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
     }
     expected = {"storage-test-rwx", "ssh-home-rwx"}
-    if any(claims.get(name) != "Bound" for name in expected):
-        raise IntegrationTestError(f"integration PVCs are not Bound: {claims}")
+    if any(
+        claims.get(name, {}).get("status", {}).get("phase") != "Bound"
+        for name in expected
+    ):
+        phases = {
+            name: item.get("status", {}).get("phase") for name, item in claims.items()
+        }
+        raise IntegrationTestError(f"integration PVCs are not Bound: {phases}")
+    pvc = claims[KUBECTL_STORAGE_PVC]
+    pv = str(pvc.get("spec", {}).get("volumeName", ""))
+    if not pv:
+        raise IntegrationTestError(f"{KUBECTL_STORAGE_PVC} has no bound PV")
+    return pv, KUBECTL_STORAGE_PVC
 
 
 def _pod_inventory(runner: Any, config: Any) -> list[dict[str, Any]]:
@@ -313,14 +340,15 @@ def _pod_inventory(runner: Any, config: Any) -> list[dict[str, Any]]:
 def _require_pods(
     pods: list[dict[str, Any]],
     substrates: set[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Require only the live workloads needed by selected substrates."""
     login = _pods_with_container(pods, "login")
     ssh = sorted(
         _pods_with_container(pods, "sshd"), key=lambda item: item["metadata"]["name"]
     )
     slurmd = _pods_with_container(pods, "slurmd")
-    invalid = len(login) != 1
+    login_required = bool({"ssh", "slurm"} & substrates)
+    invalid = login_required and len(login) != 1
     invalid = invalid or ("ssh" in substrates and len(ssh) != 2)
     invalid = invalid or ("slurm" in substrates and len(slurmd) != 2)
     if invalid:
@@ -329,7 +357,36 @@ def _require_pods(
             f"required={sorted(substrates)}, login={len(login)}, ssh={len(ssh)}, "
             f"slurmd={len(slurmd)}; run setup"
         )
-    return login[0], ssh
+    return (login[0] if login_required else None), ssh
+
+
+def _require_kubectl_nodes(
+    nodes: list[dict[str, Any]], host_architecture: str
+) -> tuple[str, ...]:
+    """Return exact selected worker nodes after platform compatibility checks."""
+    targets = sorted(
+        str(item["metadata"]["name"])
+        for item in nodes
+        if item.get("metadata", {}).get("labels", {}).get("storage-scale-test/target")
+        == "true"
+    )
+    if len(targets) != 2:
+        raise IntegrationTestError(
+            f"expected two Kubernetes target nodes; found {targets}"
+        )
+    expected = {"x86_64": "amd64", "aarch64": "arm64"}.get(host_architecture)
+    observed = {
+        str(item["metadata"]["name"]): str(
+            item.get("status", {}).get("nodeInfo", {}).get("architecture", "")
+        )
+        for item in nodes
+    }
+    if expected is None or any(observed.get(name) != expected for name in targets):
+        raise IntegrationTestError(
+            "Kubernetes target architecture mismatch: "
+            + ", ".join(f"{name}={observed.get(name)!r}" for name in targets)
+        )
+    return tuple(targets)
 
 
 def _probe_pod(
@@ -356,6 +413,141 @@ def _probe_pod(
     return result.stdout.strip()
 
 
+def _kubectl_utility_manifest(name: str, fixture: Fixture) -> str:
+    """Render one short-lived, non-root PVC utility Pod manifest."""
+    document = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {"storage-scale-test/fixture-utility": "true"},
+        },
+        "spec": {
+            "automountServiceAccountToken": False,
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 1,
+            "nodeSelector": {"storage-scale-test/login": "true"},
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": WORKLOAD_UID,
+                "runAsGroup": WORKLOAD_GID,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "utility",
+                    "image": fixture.kubectl_image,
+                    "imagePullPolicy": "Never",
+                    "command": ["/bin/bash", "-ceu", "--"],
+                    "args": ['test "$(id -u)" = 2000; exec sleep infinity'],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "volumeMounts": [
+                        {"name": "storage", "mountPath": KUBECTL_STORAGE_MOUNT}
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "storage",
+                    "persistentVolumeClaim": {"claimName": fixture.kubectl_pvc},
+                }
+            ],
+        },
+    }
+    return json.dumps(document)
+
+
+def _wait_for_kubectl_utility(runner: Any, config: Any, name: str) -> None:
+    """Wait a bounded interval for an exact utility Pod to become Ready."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        result = runner.run(
+            _kubectl(config, "-n", config.namespace, "get", "pod", name, "-o", "json"),
+            check=False,
+            timeout=20,
+        )
+        if result.returncode == 0:
+            pod = json.loads(result.stdout)
+            if _ready(pod) and not pod.get("metadata", {}).get("deletionTimestamp"):
+                return
+        time.sleep(1)
+    raise IntegrationTestError(f"storage utility Pod {name} did not become Ready")
+
+
+def _storage_utility_shell(
+    runner: Any, config: Any, fixture: Fixture, command: str, *, timeout: int = 60
+) -> str:
+    """Run one storage command without depending on a Slinky LoginSet Pod."""
+    name = f"{KUBECTL_UTILITY_PREFIX}-{secrets.token_hex(4)}"
+    manifest = _kubectl_utility_manifest(name, fixture)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+        stream.write(manifest)
+        stream.flush()
+        stream.seek(0)
+        runner.run(
+            _kubectl(config, "-n", config.namespace, "create", "-f", "-"),
+            stdin=stream,
+            timeout=60,
+        )
+    try:
+        _wait_for_kubectl_utility(runner, config, name)
+        result = runner.run(
+            [
+                *_kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    name,
+                    "-c",
+                    "utility",
+                    "--",
+                ),
+                "timeout",
+                "--kill-after=10s",
+                f"{timeout}s",
+                "bash",
+                "-lc",
+                command,
+            ],
+            timeout=135,
+        )
+        return result.stdout
+    finally:
+        result = runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "delete",
+                "pod",
+                name,
+                "--ignore-not-found",
+                "--wait=false",
+            ),
+            check=False,
+            timeout=30,
+        )
+        if result.returncode:
+            LOG.warning(
+                "could not delete storage utility Pod %s: %s",
+                name,
+                (result.stderr or result.stdout).strip(),
+            )
+
+
+def _storage_shell(
+    runner: Any, config: Any, fixture: Fixture, command: str, *, timeout: int = 60
+) -> str:
+    """Run a PVC command through LoginSet when present, otherwise a utility Pod."""
+    if fixture.login_pod is not None and fixture.login_container is not None:
+        return _login_shell(runner, config, fixture, command, timeout=timeout)
+    return _storage_utility_shell(runner, config, fixture, command, timeout=timeout)
+
+
 def _require_fixture(
     runner: Any,
     config: Any,
@@ -374,6 +566,8 @@ def _require_fixture(
     }
     if "ssh" in substrates:
         required_host_tools.update(("ssh-add", "ssh-agent"))
+    if "kubectl" in substrates:
+        required_host_tools.add("kubectl")
     missing_host_tools = [
         tool for tool in sorted(required_host_tools) if shutil.which(tool) is None
     ]
@@ -385,10 +579,10 @@ def _require_fixture(
         raise IntegrationTestError(
             f"private kubeconfig is absent at {config.kubeconfig}; run setup first"
         )
-    _require_nodes(runner, config)
-    _require_storage(runner, config)
+    nodes = _require_nodes(runner, config)
+    storage_pv, storage_pvc = _require_storage(runner, config)
     login, ssh = _require_pods(_pod_inventory(runner, config), substrates)
-    login_name = str(login["metadata"]["name"])
+    login_name = str(login["metadata"]["name"]) if login is not None else None
     addresses: tuple[str, ...] = ()
     if "ssh" in substrates:
         addresses = tuple(str(item["status"]["podIP"]) for item in ssh)
@@ -400,14 +594,15 @@ def _require_fixture(
         "for tool in bash file find tar timeout; do "
         'command -v "$tool" >/dev/null || exit 1; done'
     )
-    _probe_pod(
-        runner,
-        config,
-        login_name,
-        "login",
-        tools,
-        as_user=WORKLOAD_USER,
-    )
+    if login_name is not None:
+        _probe_pod(
+            runner,
+            config,
+            login_name,
+            "login",
+            tools,
+            as_user=WORKLOAD_USER,
+        )
     if "ssh" in substrates:
         _probe_pod(
             runner,
@@ -423,14 +618,15 @@ def _require_fixture(
             " && case $(stat -f -c %T /mnt/storage-test) in "
             "nfs|nfs4) true;; *) false;; esac"
         )
-    _probe_pod(
-        runner,
-        config,
-        login_name,
-        "login",
-        mount_probe,
-        as_user=WORKLOAD_USER,
-    )
+    if login_name is not None:
+        _probe_pod(
+            runner,
+            config,
+            login_name,
+            "login",
+            mount_probe,
+            as_user=WORKLOAD_USER,
+        )
     if "ssh" in substrates:
         _probe_pod(
             runner,
@@ -440,16 +636,17 @@ def _require_fixture(
             mount_probe,
             as_user="tester",
         )
-    login_arch = _probe_pod(
-        runner,
-        config,
-        login_name,
-        "login",
-        "uname -m",
-        as_user=WORKLOAD_USER,
-    )
     host_arch = platform.machine()
-    fixture_architectures = {"host": host_arch, "login": login_arch}
+    fixture_architectures = {"host": host_arch}
+    if login_name is not None:
+        fixture_architectures["login"] = _probe_pod(
+            runner,
+            config,
+            login_name,
+            "login",
+            "uname -m",
+            as_user=WORKLOAD_USER,
+        )
     if "ssh" in substrates:
         fixture_architectures["ssh"] = _probe_pod(
             runner,
@@ -469,9 +666,14 @@ def _require_fixture(
         )
     if host_arch not in ELBENCHO_ARCHIVES:
         raise IntegrationTestError(f"unsupported fixture architecture: {host_arch}")
+    kubectl_nodes: tuple[str, ...] = ()
+    if "kubectl" in substrates:
+        kubectl_nodes = _require_kubectl_nodes(nodes, host_arch)
     slurm_nodes: tuple[str, ...] = ()
     slurm_addresses: tuple[str, ...] = ()
     if "slurm" in substrates:
+        if login_name is None:
+            raise IntegrationTestError("Slurm fixture requires one LoginSet pod")
         slurm_output = _probe_pod(
             runner,
             config,
@@ -504,13 +706,18 @@ def _require_fixture(
             )
     return Fixture(
         login_pod=login_name,
-        login_container="login",
+        login_container="login" if login_name is not None else None,
         ssh_addresses=addresses,
         slurm_nodes=slurm_nodes,
         slurm_addresses=slurm_addresses,
         architecture=host_arch,
         ssh_home_mode=ssh_home_mode,
         storage_backend=str(state["storage_backend"]),
+        kubectl_nodes=kubectl_nodes,
+        kubectl_namespace=str(config.namespace),
+        kubectl_pv=storage_pv,
+        kubectl_pvc=storage_pvc,
+        kubectl_image=ELBENCHO_FIXTURE_IMAGE,
     )
 
 
@@ -771,9 +978,12 @@ def _override_block(
     logs_dir: str | None = None,
     extra_env: str = "",
     timeout_seconds: int = 300,
+    logical_test_root: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Return template overrides and small support-file contents."""
-    data = "/mnt/storage-test"
+    data = logical_test_root if selector == "kubectl" else "/mnt/storage-test"
+    if selector == "kubectl" and not data:
+        data = "primary"
     lines = [
         "# Bounded integration regression overrides.",
         f"export EXECUTION_SUBSTRATE={_shell(selector)}",
@@ -815,7 +1025,7 @@ def _override_block(
         else:
             lines.append("unset SSH_HOMEDIR_SHARED")
         support["ssh-hosts"] = "\n".join(fixture.ssh_addresses) + "\n"
-    else:
+    elif selector == "slurm":
         include_file = f"{remote_root}/slurm-nodes"
         ignore_file = f"{remote_root}/slurm-ignore"
         lines.extend(
@@ -832,6 +1042,27 @@ def _override_block(
         )
         support["slurm-nodes"] = "\n".join(fixture.slurm_nodes) + "\n"
         support["slurm-ignore"] = ""
+    elif selector == "kubectl":
+        if not fixture.kubectl_nodes:
+            raise IntegrationTestError(
+                "Kubernetes fixture has no selected worker nodes"
+            )
+        lines.extend(
+            (
+                "unset SSH_HOST_LIST SSH_USER SSH_HOMEDIR_SHARED",
+                "unset SLURM_NODE_INCLUDES SLURM_NODE_IGNORES",
+                f"export KUBECTL_NAMESPACE={_shell(fixture.kubectl_namespace)}",
+                f"export KUBECTL_PV={_shell(fixture.kubectl_pv)}",
+                f"export KUBECTL_PVC={_shell(fixture.kubectl_pvc)}",
+                f"export KUBECTL_NODE_SELECTOR={_shell(KUBECTL_TARGET_SELECTOR)}",
+                f"export KUBECTL_ELBENCHO_IMAGE={_shell(fixture.kubectl_image)}",
+                "export KUBECTL_IMAGE_PULL_POLICY=Never",
+                f"export KUBECTL_RUN_AS_USER={WORKLOAD_UID}",
+                f"export KUBECTL_RUN_AS_GROUP={WORKLOAD_GID}",
+            )
+        )
+    else:
+        raise IntegrationTestError(f"unsupported integration selector: {selector}")
     if extra_env:
         lines.extend(("# Scenario-specific integration overrides.", extra_env.rstrip()))
     return "\n".join(lines) + "\n", support
@@ -847,6 +1078,7 @@ def _render_env(
     logs_dir: str | None = None,
     extra_env: str = "",
     timeout_seconds: int = 300,
+    logical_test_root: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Render one runtime env from the repository's real user template."""
     text = template.read_text(encoding="utf-8")
@@ -863,6 +1095,7 @@ def _render_env(
         logs_dir=logs_dir,
         extra_env=extra_env,
         timeout_seconds=timeout_seconds,
+        logical_test_root=logical_test_root,
     )
     rendered = text.replace(anchor, overrides + "\n" + anchor)
     return rendered, support
@@ -1010,6 +1243,7 @@ def _write_runtime_files(
     extra_env: str = "",
     extra_support: dict[str, str] | None = None,
     timeout_seconds: int = 300,
+    logical_test_root: str | None = None,
 ) -> None:
     """Add the generated environment and support files to a deployment."""
     rendered, support = _render_env(
@@ -1021,6 +1255,7 @@ def _write_runtime_files(
         logs_dir=logs_dir,
         extra_env=extra_env,
         timeout_seconds=timeout_seconds,
+        logical_test_root=logical_test_root,
     )
     (workspace / "env.sh").write_text(rendered, encoding="utf-8")
     (workspace / "env.sh").chmod(0o640)
@@ -1111,12 +1346,19 @@ def _stage_workspace(
     build_root: Path,
     workspace_id: str,
 ) -> str:
-    """Stage a packaged deployment for host SSH or LoginSet Slurm execution."""
+    """Stage a packaged deployment for SSH, Slurm, or kubectl execution."""
     if selector == "ssh":
         workspace = build_root / "ssh" / "storage-scale-test"
         shutil.copytree(extracted, workspace)
         _write_runtime_files(workspace, selector, str(workspace), fixture)
         return str(workspace)
+    if selector == "kubectl":
+        workspace = build_root / "kubectl" / "storage-scale-test"
+        shutil.copytree(extracted, workspace)
+        _write_runtime_files(workspace, selector, str(workspace), fixture)
+        return str(workspace)
+    if selector != "slurm":
+        raise IntegrationTestError(f"unsupported integration selector: {selector}")
 
     remote_base = f"{REMOTE_BASE}/workspaces/{workspace_id}"
     remote_root = f"{remote_base}/storage-scale-test"
@@ -1202,14 +1444,20 @@ def _test_command(
             "-c",
             host_command,
         ]
-    return _pod_command(
-        config,
-        fixture.login_pod,
-        fixture.login_container,
-        command,
-        as_user=WORKLOAD_USER,
-        timeout=timeout,
-        kill_after=105,
+    if selector == "slurm":
+        if fixture.login_pod is None or fixture.login_container is None:
+            raise IntegrationTestError("Slurm test command requires a LoginSet pod")
+        return _pod_command(
+            config,
+            fixture.login_pod,
+            fixture.login_container,
+            command,
+            as_user=WORKLOAD_USER,
+            timeout=timeout,
+            kill_after=105,
+        )
+    raise IntegrationTestError(
+        f"selector {selector!r} requires the Kubernetes lifecycle adapter"
     )
 
 
@@ -1227,7 +1475,14 @@ def _run_step(
 ) -> str:
     """Run one bounded substrate step and preserve diagnostic output."""
     LOG.info("Running %s filesystem step: %s", selector, name)
-    outer_grace = 120 if selector == "slurm" else 30
+    if selector == "slurm":
+        outer_grace = 120
+    elif selector == "ssh":
+        outer_grace = 30
+    else:
+        raise IntegrationTestError(
+            f"selector {selector!r} requires the Kubernetes lifecycle adapter"
+        )
     result = runner.run(
         _test_command(config, fixture, selector, command, timeout),
         check=False,
@@ -1260,6 +1515,10 @@ def _ordered_worker_evidence(selector: str, sweep_output: str, result: Path) -> 
     """Return substrate-appropriate durable worker-selection evidence."""
     if selector == "ssh":
         return sweep_output
+    if selector != "slurm":
+        raise IntegrationTestError(
+            f"selector {selector!r} does not use legacy worker-log evidence"
+        )
     logs = sorted((result / "executions").glob("*.log"))
     logs.extend(sorted(result.glob("coordinator-*.log")))
     return "\n".join(
@@ -1271,7 +1530,14 @@ def _assert_ordered_workers(
     fixture: Fixture, selector: str, sweep_output: str, result: Path
 ) -> None:
     """Prove increasing cells use the configured workers in prefix order."""
-    workers = fixture.ssh_addresses if selector == "ssh" else fixture.slurm_addresses
+    if selector == "ssh":
+        workers = fixture.ssh_addresses
+    elif selector == "slurm":
+        workers = fixture.slurm_addresses
+    else:
+        raise IntegrationTestError(
+            f"selector {selector!r} requires durable Kubernetes worker evidence"
+        )
     expected = {
         "1": workers[0],
         "2": ",".join(workers),
@@ -1301,7 +1567,9 @@ def _copy_result_for_reporting(
     destination.mkdir(parents=True, exist_ok=True)
     if selector == "ssh":
         shutil.copytree(result_dir, destination / Path(result_dir).name)
-    else:
+    elif selector == "slurm":
+        if fixture.login_pod is None or fixture.login_container is None:
+            raise IntegrationTestError("Slurm result copy requires a LoginSet pod")
         runner.run(
             [
                 *_kubectl(config, "-n", config.namespace, "cp"),
@@ -1311,6 +1579,10 @@ def _copy_result_for_reporting(
                 destination / Path(result_dir).name,
             ],
             timeout=120,
+        )
+    else:
+        raise IntegrationTestError(
+            f"selector {selector!r} publishes collected results locally"
         )
     return destination / Path(result_dir).name
 
@@ -1352,7 +1624,25 @@ mkdir -p -- {_shell(data_root + '/primary')} {_shell(data_root + '/secondary')}
 printf 'scenario-owned\n' > {_shell(data_root + '/primary/.integration-sentinel')}
 printf 'scenario-owned\n' > {_shell(data_root + '/secondary/.integration-sentinel')}
 """.strip()
-    _login_shell(runner, config, fixture, command)
+    _storage_shell(runner, config, fixture, command)
+
+
+def _prepare_kubectl_scenario_data(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    data_root: str,
+) -> None:
+    """Reset one marker-owned scenario subtree through the PVC utility Pod."""
+    command = f"""
+set -euo pipefail
+umask 0007
+rm -rf -- {_shell(data_root)}
+mkdir -p -- {_shell(data_root + '/primary')} {_shell(data_root + '/secondary')}
+printf 'scenario-owned\n' > {_shell(data_root + '/primary/.integration-sentinel')}
+printf 'scenario-owned\n' > {_shell(data_root + '/secondary/.integration-sentinel')}
+""".strip()
+    _storage_utility_shell(runner, config, fixture, command)
 
 
 def _sync_step_runtime(
@@ -1384,6 +1674,25 @@ def _sync_step_runtime(
             timeout_seconds=step.timeout_seconds,
         )
         return
+    if runtime.selector == "kubectl":
+        _write_runtime_files(
+            Path(runtime.workspace),
+            runtime.selector,
+            runtime.workspace,
+            fixture,
+            template=template,
+            results_dir=result_base,
+            logs_dir=f"{runtime.workspace}/logs/{step.name}",
+            extra_env=extra_env,
+            extra_support=extra_support,
+            timeout_seconds=step.timeout_seconds,
+            logical_test_root=f"{runtime.data_root}/primary",
+        )
+        return
+    if runtime.selector != "slurm":
+        raise IntegrationTestError(
+            f"unsupported integration selector: {runtime.selector}"
+        )
     stage = runtime.local_workspace / f"runtime-{step.name}"
     if stage.exists():
         shutil.rmtree(stage)
@@ -1436,7 +1745,7 @@ mkdir -p -- {_shell(str(PurePosixPath(path).parent))}
 truncate -s {generated.size_bytes} -- {_shell(path)}
 test "$(stat -c %s -- {_shell(path)})" -eq {generated.size_bytes}
 """.strip()
-        _login_shell(runner, config, fixture, command)
+        _storage_shell(runner, config, fixture, command)
 
 
 def _discover_result(
@@ -1485,7 +1794,7 @@ def _copy_scenario_result(
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(remote_result, target)
-    else:
+    elif runtime.selector == "slurm":
         target = _copy_result_for_reporting(
             runner,
             config,
@@ -1493,6 +1802,10 @@ def _copy_scenario_result(
             runtime.selector,
             remote_result,
             destination,
+        )
+    else:
+        raise IntegrationTestError(
+            f"selector {runtime.selector!r} publishes collected results locally"
         )
     runtime.copied_results.append(target)
     return target
@@ -1686,7 +1999,7 @@ def _assert_dataset_state(
     """Validate cleanup or retention only within scenario-owned paths."""
     if step.dataset is DatasetExpectation.PRESERVED:
         if retained_path:
-            _login_shell(runner, config, fixture, f"test -e {_shell(retained_path)}")
+            _storage_shell(runner, config, fixture, f"test -e {_shell(retained_path)}")
         return
     paths = list(_execution_targets(result)) if result is not None else []
     if step.dataset is DatasetExpectation.REMOVED and retained_path:
@@ -1694,7 +2007,7 @@ def _assert_dataset_state(
     if not paths:
         return
     probes = "\n".join(f"test ! -e {_shell(path)}" for path in paths)
-    _login_shell(runner, config, fixture, f"set -euo pipefail\n{probes}")
+    _storage_shell(runner, config, fixture, f"set -euo pipefail\n{probes}")
 
 
 def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> None:
@@ -1706,6 +2019,19 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
             if line.startswith("# elbencho ")
         )
+    # Kubernetes publishes Elbencho's own result files rather than a
+    # transport-specific coordinator log. Its COMMAND LINE record is native
+    # evidence of the same effective arguments and remains useful if the
+    # shared runner's human-facing log wording changes.
+    if not command_lines:
+        for path in result.glob("*.out"):
+            command_lines.extend(
+                line
+                for line in path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if line.startswith("COMMAND LINE:")
+            )
     evidence = "\n".join(command_lines)
     if not evidence:
         raise IntegrationTestError(
@@ -1817,6 +2143,12 @@ def _reset_result_base(
             shutil.rmtree(path)
         path.mkdir(parents=True)
         return
+    if runtime.selector == "kubectl":
+        path = Path(result_base)
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True)
+        return
     _login_shell(
         runner,
         config,
@@ -1835,6 +2167,26 @@ def _validate_step_environment(
     log_dir: Path,
 ) -> None:
     """Run the repository's validator for a rendered scenario environment."""
+    if runtime.selector == "kubectl":
+        result = runner.run(
+            [
+                "env",
+                f"KUBECONFIG={config.kubeconfig}",
+                Path(runtime.workspace) / "validate_env.sh",
+            ],
+            cwd=Path(runtime.workspace),
+            check=False,
+            timeout=180,
+        )
+        output = result.stdout + result.stderr
+        path = log_dir / f"kubectl-{step.name}-validate-env.log"
+        path.write_text(output, encoding="utf-8")
+        if result.returncode or VALIDATION_SUCCESS not in output:
+            raise IntegrationTestError(
+                f"{runtime.scenario.name}/{runtime.selector}/{step.name}: "
+                f"environment validation failed; full output: {path}"
+            )
+        return
     output = _run_step(
         runner,
         config,
@@ -2061,12 +2413,19 @@ def _make_scenario_runtime(
 ) -> ScenarioRuntime:
     """Create cleanup-capable scenario identity before remote mutation."""
     workspace_id = f"{run_id}-{scenario.name}-{selector}"
-    workspace = (
-        str(build_root / "ssh" / "storage-scale-test")
-        if selector == "ssh"
-        else f"{REMOTE_BASE}/workspaces/{workspace_id}/storage-scale-test"
+    if selector == "ssh":
+        workspace = str(build_root / "ssh" / "storage-scale-test")
+    elif selector == "kubectl":
+        workspace = str(build_root / "kubectl" / "storage-scale-test")
+    elif selector == "slurm":
+        workspace = f"{REMOTE_BASE}/workspaces/{workspace_id}/storage-scale-test"
+    else:
+        raise IntegrationTestError(f"unsupported integration selector: {selector}")
+    data_root = (
+        f"integration-regression/{workspace_id}"
+        if selector == "kubectl"
+        else f"{REMOTE_BASE}/test-data/{workspace_id}"
     )
-    data_root = f"{REMOTE_BASE}/test-data/{workspace_id}"
     values = {
         "workspace": workspace,
         "test_root": f"{data_root}/primary",
@@ -2110,7 +2469,15 @@ def _prepare_scenario_runtime(
         raise IntegrationTestError(
             f"scenario workspace drifted: expected {runtime.workspace}, found {workspace}"
         )
-    _prepare_scenario_data(runner, config, fixture, runtime.data_root)
+    if runtime.selector == "kubectl":
+        _prepare_kubectl_scenario_data(
+            runner,
+            config,
+            fixture,
+            f"{KUBECTL_STORAGE_MOUNT}/{runtime.data_root}",
+        )
+    else:
+        _prepare_scenario_data(runner, config, fixture, runtime.data_root)
 
 
 def _run_regular_scenario(
@@ -2134,6 +2501,271 @@ def _run_regular_scenario(
             report_workspace,
             log_dir,
         )
+
+
+def _run_kubectl_command(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    name: str,
+    arguments: tuple[str, ...],
+    log_dir: Path,
+    timeout: int,
+    *,
+    expected_failure: bool = False,
+) -> str:
+    """Run one local kubectl-sweep command with the fixture kubeconfig."""
+    command: list[str | Path] = [
+        "env",
+        f"KUBECONFIG={config.kubeconfig}",
+        "timeout",
+        "--kill-after=15s",
+        f"{timeout}s",
+        Path(runtime.workspace) / "storage-tests" / "fs" / "nv-elbencho-sweep.sh",
+        *arguments,
+    ]
+    LOG.info("Running kubectl filesystem step: %s", name)
+    result = runner.run(
+        command,
+        cwd=Path(runtime.workspace),
+        check=False,
+        timeout=timeout + 30,
+    )
+    output = result.stdout + result.stderr
+    log_path = log_dir / f"kubectl-{name}.log"
+    log_path.write_text(output, encoding="utf-8")
+    log_path.chmod(0o640)
+    if expected_failure and result.returncode == 0:
+        raise IntegrationTestError(
+            f"kubectl {name} unexpectedly succeeded; full output: {log_path}"
+        )
+    if result.returncode and not expected_failure:
+        raise IntegrationTestError(
+            f"kubectl {name} failed with exit code {result.returncode}; full "
+            f"output: {log_path}\n{output.strip()[-8000:]}"
+        )
+    return output
+
+
+def _kubectl_output_value(output: str, key: str) -> str:
+    """Read one exact stable lifecycle key from product command output."""
+    values = [
+        line.removeprefix(f"{key}=")
+        for line in output.splitlines()
+        if line.startswith(f"{key}=")
+    ]
+    if (
+        len(values) != 1
+        or not values[0]
+        or any(char in values[0] for char in "\r\n\x00")
+    ):
+        raise IntegrationTestError(f"kubectl lifecycle output lacks one safe {key}")
+    return values[0]
+
+
+def _kubectl_submission(output: str) -> tuple[Path, str]:
+    """Return the local results root and attempt ID from a successful submit."""
+    result = Path(_kubectl_output_value(output, "STORAGE_SCALE_TEST_RESULTS_DIR"))
+    attempt_id = _kubectl_output_value(output, "STORAGE_SCALE_TEST_ATTEMPT_ID")
+    if not attempt_id or not re.fullmatch(r"[0-9a-f]{8}", attempt_id):
+        raise IntegrationTestError(f"invalid kubectl attempt identity: {attempt_id!r}")
+    return result, attempt_id
+
+
+def _kubectl_lifecycle_state(output: str) -> str:
+    """Read and validate one stable lifecycle state from status output."""
+    state = _kubectl_output_value(output, "STORAGE_SCALE_TEST_KUBECTL_STATE")
+    if state not in KUBECTL_STATUS_STATES:
+        raise IntegrationTestError(f"invalid kubectl lifecycle state: {state!r}")
+    return state
+
+
+def _wait_for_kubectl_terminal_state(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    result_root: Path,
+    log_dir: Path,
+    timeout: int,
+) -> str:
+    """Poll the product status command until one documented terminal state."""
+    deadline = time.monotonic() + timeout
+    last_command_error: IntegrationTestError | None = None
+    while time.monotonic() < deadline:
+        remaining = max(1, int(deadline - time.monotonic()))
+        try:
+            output = _run_kubectl_command(
+                runner,
+                config,
+                runtime,
+                "status",
+                ("--status", str(result_root)),
+                log_dir,
+                min(30, remaining),
+            )
+        except IntegrationTestError as error:
+            last_command_error = error
+            LOG.warning("Transient kubectl status failure; retrying: %s", error)
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+            continue
+        state = _kubectl_lifecycle_state(output)
+        if state in KUBECTL_TERMINAL_STATES:
+            return state
+        time.sleep(2)
+    detail = f"; last status error: {last_command_error}" if last_command_error else ""
+    raise IntegrationTestError(
+        f"kubectl attempt at {result_root} did not reach a terminal state within "
+        f"{timeout} seconds{detail}"
+    )
+
+
+def _collected_result_root(result_root: Path) -> Path:
+    """Find the sole collected result without relying on timestamp spelling."""
+    if (result_root / "executions").is_dir():
+        return result_root
+    candidates = (
+        sorted(
+            path
+            for path in result_root.iterdir()
+            if path.is_dir() and (path / "executions").is_dir()
+        )
+        if result_root.is_dir()
+        else []
+    )
+    if len(candidates) != 1:
+        raise IntegrationTestError(
+            f"kubectl collection produced {len(candidates)} result trees under "
+            f"{result_root}"
+        )
+    return candidates[0]
+
+
+def _assert_kubectl_ordered_workers(fixture: Fixture, result: Path) -> None:
+    """Validate direct Pod-IP worker evidence rather than controller log prose."""
+    execution_root = result / "executions"
+    two_node = execution_root / "0002.workers.tsv"
+    if not two_node.is_file():
+        raise IntegrationTestError(
+            f"missing durable Kubernetes worker evidence: {two_node}"
+        )
+    rows = [
+        line.split("\t") for line in two_node.read_text(encoding="utf-8").splitlines()
+    ]
+    if len(rows) != 2 or any(len(row) != 4 for row in rows):
+        raise IntegrationTestError(f"invalid Kubernetes worker evidence: {two_node}")
+    nodes = tuple(row[0] for row in rows)
+    addresses = tuple(row[3] for row in rows)
+    expected_nodes = tuple(sorted(fixture.kubectl_nodes))
+    try:
+        addresses_are_ipv4 = all(
+            ipaddress.ip_address(address).version == 4 for address in addresses
+        )
+    except ValueError:
+        addresses_are_ipv4 = False
+    if nodes != expected_nodes or not addresses_are_ipv4:
+        raise IntegrationTestError(
+            f"Kubernetes ordered worker evidence was nodes={nodes}, addresses={addresses}; "
+            f"expected nodes={expected_nodes}"
+        )
+
+
+def _run_kubectl_baseline(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Exercise submit/status/collect through the public kubectl lifecycle CLI."""
+    if runtime.scenario.name != "baseline":
+        raise IntegrationTestError(
+            f"kubectl integration adapter has no scenario implementation for "
+            f"{runtime.scenario.name}"
+        )
+    step = runtime.scenario.steps[0]
+    result_base = str(Path(runtime.workspace) / "results" / step.name)
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(runner, config, fixture, runtime, step, template, result_base)
+    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    submission = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        step.name,
+        step.render_arguments(runtime.values),
+        log_dir,
+        step.timeout_seconds,
+    )
+    result_root, attempt_id = _kubectl_submission(submission)
+    runtime.values["kubectl_result_root"] = str(result_root)
+    LOG.info("Submitted Kubernetes baseline attempt %s", attempt_id)
+    terminal = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, result_root, log_dir, step.timeout_seconds
+    )
+    if terminal != "SUCCESS":
+        raise IntegrationTestError(f"kubectl baseline ended in {terminal}")
+    _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "collect",
+        ("--collect", str(result_root)),
+        log_dir,
+        180,
+    )
+    runtime.values["kubectl_collected"] = "1"
+    result = _collected_result_root(result_root)
+    _assert_execution_contract(runtime.scenario, step, result)
+    _assert_semantic_flags(runtime.scenario.name, step, result)
+    _assert_kubectl_ordered_workers(fixture, result)
+    _assert_dataset_state(runner, config, fixture, step, result, None)
+    _assert_scenario_report(runner, report_workspace, result, runtime, step, log_dir)
+
+
+def _cleanup_kubectl_attempt(
+    runner: Any, config: Any, runtime: ScenarioRuntime
+) -> None:
+    """Ask the product lifecycle to stop and collect an interrupted attempt."""
+    result_root = runtime.values.get("kubectl_result_root")
+    if not result_root:
+        return
+    # A successful collect has already released the remote Job, worker set,
+    # lock, and transfer helpers.  Do not make success depend on how the
+    # product treats a second cancel/collect against a COLLECTED attempt.
+    if runtime.values.get("kubectl_collected") == "1":
+        return
+    command_root = Path(runtime.workspace) / "storage-tests" / "fs"
+    for operation in ("--cancel", "--collect"):
+        result = runner.run(
+            [
+                "env",
+                f"KUBECONFIG={config.kubeconfig}",
+                "timeout",
+                "--kill-after=15s",
+                "90s",
+                command_root / "nv-elbencho-sweep.sh",
+                operation,
+                result_root,
+            ],
+            cwd=Path(runtime.workspace),
+            check=False,
+            timeout=120,
+        )
+        if result.returncode:
+            output = result.stdout + result.stderr
+            if operation == "--collect":
+                try:
+                    terminal = _kubectl_lifecycle_state(output)
+                except IntegrationTestError:
+                    terminal = ""
+                if terminal in {"FAILED", "CANCELLED"}:
+                    continue
+            detail = (result.stderr or result.stdout).strip()
+            raise IntegrationTestError(
+                f"kubectl scenario cleanup {operation} failed for {result_root}: {detail}"
+            )
 
 
 def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
@@ -2191,7 +2823,7 @@ def _preserve_scenario_failure_diagnostics(
         source = f"{runtime.workspace}/{name}"
         target = destination / name
         try:
-            if runtime.selector == "ssh":
+            if runtime.selector in {"ssh", "kubectl"}:
                 local_source = Path(source)
                 if local_source.exists():
                     shutil.copytree(local_source, target, dirs_exist_ok=True)
@@ -2235,6 +2867,26 @@ def _cleanup_scenario_storage(
     runtime: ScenarioRuntime,
 ) -> None:
     """Remove one scenario's isolated PVC data and Slurm deployment."""
+    if runtime.selector == "kubectl":
+        logical_root = PurePosixPath(runtime.data_root)
+        expected_parent = PurePosixPath("integration-regression")
+        if logical_root.parent != expected_parent or not logical_root.name:
+            raise IntegrationTestError(
+                f"refusing to remove unexpected Kubernetes scenario data: "
+                f"{logical_root}"
+            )
+        _storage_utility_shell(
+            runner,
+            config,
+            fixture,
+            f"rm -rf -- {_shell(KUBECTL_STORAGE_MOUNT + '/' + str(logical_root))}",
+            timeout=120,
+        )
+        return
+    if runtime.selector not in {"ssh", "slurm"}:
+        raise IntegrationTestError(
+            f"unsupported integration selector: {runtime.selector}"
+        )
     data_root = PurePosixPath(runtime.data_root)
     data_base = PurePosixPath(REMOTE_BASE) / "test-data"
     targets = [data_root]
@@ -2282,6 +2934,8 @@ def _cleanup_scenario_resources(
     operations = []
     if runtime.selector == "ssh":
         operations.append(lambda: _cleanup_ssh_remote_results(runner, config))
+    if runtime.selector == "kubectl":
+        operations.append(lambda: _cleanup_kubectl_attempt(runner, config, runtime))
     operations.append(
         lambda: _cleanup_scenario_storage(runner, config, fixture, runtime)
     )
@@ -2607,7 +3261,7 @@ def _run_failure_resume(
             bundled_runtime,
         )
         injected_first = first
-    else:
+    elif runtime.selector == "slurm":
         plan, operations = _slurm_failure_plan(
             runner,
             config,
@@ -2618,6 +3272,10 @@ def _run_failure_resume(
             bundled_runtime,
         )
         injected_first = first
+    else:
+        raise IntegrationTestError(
+            f"failure-resume has no adapter for {runtime.selector!r}"
+        )
     result_base = f"{runtime.workspace}/results/{first.name}"
     _reset_result_base(runner, config, fixture, runtime, result_base)
     _sync_step_runtime(
@@ -2801,7 +3459,17 @@ def run_filesystem_tests(
                         archive,
                         extracted,
                     )
-                    if scenario == "failure-resume":
+                    if step.substrate.value == "kubectl":
+                        _run_kubectl_baseline(
+                            runner,
+                            config,
+                            fixture,
+                            runtime_state,
+                            extracted / "env.sh.template",
+                            report_workspace,
+                            scenario_logs,
+                        )
+                    elif scenario == "failure-resume":
                         _run_failure_resume(
                             runner,
                             config,

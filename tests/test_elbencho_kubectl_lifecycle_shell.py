@@ -16,6 +16,7 @@
 """Fault-oriented contracts for Kubernetes sweep lifecycle primitives."""
 
 from pathlib import Path
+import hashlib
 import shutil
 import subprocess
 import tarfile
@@ -105,6 +106,14 @@ def test_attempt_templates_are_yaml_and_restrict_security_surface() -> None:
     assert pod_spec["affinity"]["nodeAffinity"][
         "requiredDuringSchedulingIgnoredDuringExecution"
     ]
+    expression = pod_spec["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"][0]
+    assert expression == {
+        "key": "kubernetes.io/hostname",
+        "operator": "In",
+        "values": ["node-a", "node-b"],
+    }
     assert (
         pod_spec["containers"][0]["securityContext"]["allowPrivilegeEscalation"]
         is False
@@ -199,6 +208,39 @@ def test_collection_staging_cannot_escape_results_root(tmp_path: Path) -> None:
     assert not outside.exists()
 
 
+def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -> None:
+    """Collection publishes exit-code and worker evidence beside cell status."""
+    state = tmp_path / "state"
+    executions = state / "executions"
+    executions.mkdir(parents=True)
+    (executions / "0001.status").write_text("SUCCESS\n", encoding="utf-8")
+    (executions / "0001.exitcode").write_text("0\n", encoding="utf-8")
+    (executions / "0001.workers.tsv").write_text(
+        "node-a\tpod-a\tuid-a\t10.0.0.1\n", encoding="utf-8"
+    )
+    results = tmp_path / "results"
+    (results / "executions").mkdir(parents=True)
+    manifest = state / "publication-manifest.tsv"
+    rows = []
+    for name in ("0001.status", "0001.exitcode", "0001.workers.tsv"):
+        source = executions / name
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        rows.append(
+            f"ledger\texecutions/{name}\texecutions/{name}\t"
+            f"{source.stat().st_size}\t{digest}"
+        )
+    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    result = _bash(f"_kubectl_merge_collected_results {str(state)!r} {str(results)!r}")
+    assert result.returncode == 0, result.stderr
+    assert (results / "executions/0001.status").read_text(encoding="utf-8") == (
+        "SUCCESS\n"
+    )
+    assert (results / "executions/0001.exitcode").read_text(encoding="utf-8") == ("0\n")
+    assert "node-a" in (results / "executions/0001.workers.tsv").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_fake_kubectl_discovers_only_ready_nonterminating_workers(
     tmp_path: Path,
 ) -> None:
@@ -208,12 +250,36 @@ def test_fake_kubectl_discovers_only_ready_nonterminating_workers(
     output = tmp_path / "workers.tsv"
     result = _bash(f"""
         kubectl_run_bounded() {{
-          printf 'node-a\\tpod-a\\tpoduid-a\\t10.0.0.1\\t\\tTrue\\tsha256:one\\n'
-          printf 'node-b\\tpod-old\\tpoduid-old\\t10.0.0.2\\t2026-01-01T00:00:00Z\\tTrue\\tsha256:one\\n'
+          printf 'node-a\\tpod-a\\tpoduid-a\\t10.0.0.1\\tTrue\\tsha256:one\\t\\n'
+          printf 'node-b\\tpod-old\\tpoduid-old\\t10.0.0.2\\tTrue\\tsha256:one\\t2026-01-01T00:00:00Z\\n'
         }}
         ! kubectl_discover_worker_endpoints test-ns 1234abcd {str(nodes)!r} {str(output)!r}
         """)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "row",
+    (
+        "node-a\\tpod-a\\tpoduid-a\\t999.0.0.1\\tTrue\\tsha256:one\\t",
+        "node-a\\tBad_Pod\\tpoduid-a\\t10.0.0.1\\tTrue\\tsha256:one\\t",
+        "node-a\\tpod-a\\tbad/uid\\t10.0.0.1\\tTrue\\tsha256:one\\t",
+    ),
+)
+def test_worker_discovery_rejects_each_malformed_endpoint_field(
+    tmp_path: Path, row: str
+) -> None:
+    """A malformed IP, Pod name, or Pod UID cannot pass a compound guard."""
+    nodes = tmp_path / "nodes.tsv"
+    nodes.write_text("node-a\tuid-a\tamd64\n", encoding="utf-8")
+    output = tmp_path / "workers.tsv"
+    result = _bash(f"""
+        kubectl_run_bounded() {{ printf '{row}\\n'; }}
+        ! kubectl_discover_worker_endpoints test-ns 1234abcd \
+          {str(nodes)!r} {str(output)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert not output.exists()
 
 
 def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
@@ -236,6 +302,26 @@ def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
         """)
     assert result.returncode == 0, result.stderr
     assert "deleted" in result.stdout
+
+
+def test_helper_creation_returns_uid_to_common_caller_variable_names() -> None:
+    """Nested Bash output variables must not be shadowed by helper locals."""
+    result = _bash("""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        kubectl_run_bounded() { :; }
+        kubectl_verify_object_identity() { printf 'uid-1\n'; }
+        kubectl_wait_owned_ready_pod() { return 0; }
+        kubectl_create_owned_object uid Pod helper test-ns \
+          0123456789abcdef0123456789abcdef 1234abcd manifest
+        [[ "$uid" == uid-1 ]]
+        kubectl_create_helper_pod helper_uid transfer test-ns \
+          sst-elb-1234abcd-upload-1234 \
+          0123456789abcdef0123456789abcdef 1234abcd node-a 1234
+        [[ "$helper_uid" == uid-1 ]]
+        """)
+    assert result.returncode == 0, result.stderr
 
 
 def test_runtime_configuration_rejects_every_invalid_field() -> None:
@@ -326,6 +412,25 @@ def test_resource_journal_distinguishes_absence_from_corruption(tmp_path: Path) 
         printf 'not shell metadata\n' > "$root/attempts/1234abcd/resources/workers.sh"
         kubectl_run_bounded() { return 0; }
         ! kubectl_cleanup_journaled_resources "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_generic_cleanup_recovers_dynamic_inspector_journals(tmp_path: Path) -> None:
+    """Killed status and collection clients leave helpers generic cleanup removes."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd \\
+          status-deadbeef Pod sst-elb-1234abcd-status-deadbeef test-ns \\
+          pod-uid 0123456789abcdef0123456789abcdef
+        deleted=0
+        kubectl_delete_owned_object() { deleted=$((deleted + 1)); }
+        kubectl_cleanup_journaled_resources "$root" "$fd" 1234abcd
+        [[ "$deleted" -eq 1 ]]
+        kubectl_attempt_step_done "$root" 1234abcd delete-status-deadbeef
+        kubectl_cleanup_journaled_resources "$root" "$fd" 1234abcd
+        [[ "$deleted" -eq 1 ]]
         kubectl_local_lock_release "$fd"
         """)
     assert result.returncode == 0, result.stderr

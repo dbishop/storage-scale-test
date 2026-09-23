@@ -668,6 +668,17 @@ _coordinator_run_one() {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
+    # Reified generated-target ownership is expressed in user-facing logical
+    # paths. The shared workload's deletion safeguards consult these captured
+    # values directly, so freeze their Kubernetes mappings before any phase.
+    ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$test_dirs_csv"
+    ELBENCHO_RUN_GENERATED_TEST_ROOT=$(
+        kubectl_map_logical_path "$ELBENCHO_RUN_GENERATED_TEST_ROOT"
+    ) || {
+        _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+        return 1
+    }
+    export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV ELBENCHO_RUN_GENERATED_TEST_ROOT
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
         mapped_read_from=$(kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM") || {
             _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1

@@ -194,6 +194,7 @@ _NORMAL_PHASES = (
 )
 
 _BOTH_SUBSTRATES = frozenset({"ssh", "slurm"})
+_BASELINE_SUBSTRATES = frozenset({"ssh", "slurm", "kubectl"})
 _SSH_ONLY = frozenset({"ssh"})
 _SLURM_ONLY = frozenset({"slurm"})
 
@@ -309,7 +310,7 @@ def _step(
 def _baseline() -> FilesystemScenarioSpec:
     return FilesystemScenarioSpec(
         "baseline",
-        _BOTH_SUBSTRATES,
+        _BASELINE_SUBSTRATES,
         (
             _step(
                 "buffered-sweep",
@@ -676,7 +677,8 @@ def _validate_spec(spec: FilesystemScenarioSpec) -> None:
     """Validate one scenario and its sequence dependencies."""
     if not spec.name or not spec.steps:
         raise ScenarioSpecError("scenario names and step sequences must be nonempty")
-    if not spec.substrates or not spec.substrates <= _BOTH_SUBSTRATES:
+    allowed_substrates = _BOTH_SUBSTRATES | {"kubectl"}
+    if not spec.substrates or not spec.substrates <= allowed_substrates:
         raise ScenarioSpecError(f"{spec.name}: invalid substrates")
     available: set[str] = set()
     step_names: set[str] = set()

@@ -91,7 +91,7 @@ def test_human_listing_exposes_names_and_substrate_compatibility():
         if (fields := line.split("\t", 2))
     }
 
-    assert rows["baseline"] == "slurm,ssh"
+    assert rows["baseline"] == "kubectl,slurm,ssh"
     assert rows["ssh-shared-home"] == "ssh"
     assert rows["slurm-scheduling"] == "slurm"
 
@@ -103,7 +103,10 @@ def test_default_plan_expands_substrates_and_batches_shared_home():
     shared_start = plan.index(("transition", "shared"))
     shared_stop = plan.index(("transition", "separate"))
     assert plan[shared_start + 1 : shared_stop] == (("work", "ssh-shared-home", "ssh"),)
-    assert plan[shared_stop + 1 :] == (("work", "slurm-scheduling", "slurm"),)
+    assert plan[shared_stop + 1 :] == (
+        ("work", "baseline", "kubectl"),
+        ("work", "slurm-scheduling", "slurm"),
+    )
     assert all(
         substrate != "ssh"
         for kind, _name, substrate in plan[:shared_start]
@@ -133,6 +136,15 @@ def test_slurm_selection_needs_no_home_transition():
     assert {step.substrate for step in plan} == {Substrate.SLURM}
 
 
+def test_kubectl_selection_has_no_ssh_transition_and_uses_baseline_only():
+    """Kubernetes work is independently selectable and has no SSH side effect."""
+    plan = plan_scenarios(
+        substrate=Substrate.KUBECTL, registry=_SCENARIOS.SCENARIO_CATALOG
+    )
+
+    assert plan == (WorkItem(_SCENARIOS.SCENARIO_CATALOG[0], Substrate.KUBECTL),)
+
+
 def test_requested_scenarios_are_order_independent():
     """Repeatable CLI selections do not determine execution order."""
     names = ("slurm-scheduling", "baseline", "ssh-shared-home")
@@ -149,10 +161,14 @@ def test_registry_order_does_not_determine_execution_order():
     assert _plan_identity(registry=reversed(_SCENARIOS.SCENARIO_CATALOG)) == expected
 
 
-@pytest.mark.parametrize("substrate", ("ssh", "slurm"))
+@pytest.mark.parametrize("substrate", ("ssh", "slurm", "kubectl"))
 def test_explicit_incompatible_scenario_is_rejected(substrate):
     """An explicit scenario/substrate mismatch is actionable."""
-    scenario = "slurm-cartesian" if substrate == "ssh" else "ssh-shared-home"
+    scenario = {
+        "ssh": "slurm-cartesian",
+        "slurm": "ssh-shared-home",
+        "kubectl": "slurm-cartesian",
+    }[substrate]
 
     with pytest.raises(ScenarioPlanningError, match="incompatible"):
         plan_scenarios(
