@@ -249,6 +249,6 @@ def test_legacy_resume_cannot_be_reinterpreted_as_kubectl(tmp_path):
     result = _run_resume_selection_case(tmp_path, "kubectl", "")
     assert result.returncode != 0
     assert (
-        "legacy resume snapshots require EXECUTION_SUBSTRATE=ssh or slurm"
+        "legacy resume snapshots require inherited EXECUTION_SUBSTRATE=ssh or slurm"
         in result.stderr
     )
