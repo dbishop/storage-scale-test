@@ -100,6 +100,10 @@ KUBECTL_UTILITY_PREFIX = "storage-scale-test-utility"
 KUBECTL_TARGET_SELECTOR = "storage-scale-test/target=true"
 KUBECTL_STORAGE_PVC = "storage-test-rwx"
 KUBECTL_STORAGE_MOUNT = "/mnt/storage-scale-test"
+KUBERNETES_DNS_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+KUBERNETES_UID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
     {"PREPARED", "SUBMITTED", "RUNNING"}
@@ -425,7 +429,9 @@ def _probe_pod(
     return result.stdout.strip()
 
 
-def _kubectl_utility_manifest(name: str, fixture: Fixture) -> str:
+def _kubectl_utility_manifest(
+    name: str, fixture: Fixture, node_name: str | None = None
+) -> str:
     """Render one short-lived, non-root PVC utility Pod manifest."""
     document = {
         "apiVersion": "v1",
@@ -438,7 +444,11 @@ def _kubectl_utility_manifest(name: str, fixture: Fixture) -> str:
             "automountServiceAccountToken": False,
             "restartPolicy": "Never",
             "terminationGracePeriodSeconds": 1,
-            "nodeSelector": {"storage-scale-test/login": "true"},
+            **(
+                {"nodeName": node_name}
+                if node_name
+                else {"nodeSelector": {"storage-scale-test/login": "true"}}
+            ),
             "securityContext": {
                 "runAsNonRoot": True,
                 "runAsUser": WORKLOAD_UID,
@@ -490,11 +500,17 @@ def _wait_for_kubectl_utility(runner: Any, config: Any, name: str) -> None:
 
 
 def _storage_utility_shell(
-    runner: Any, config: Any, fixture: Fixture, command: str, *, timeout: int = 60
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    command: str,
+    *,
+    timeout: int = 60,
+    node_name: str | None = None,
 ) -> str:
     """Run one storage command without depending on a Slinky LoginSet Pod."""
     name = f"{KUBECTL_UTILITY_PREFIX}-{secrets.token_hex(4)}"
-    manifest = _kubectl_utility_manifest(name, fixture)
+    manifest = _kubectl_utility_manifest(name, fixture, node_name)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
         stream.write(manifest)
         stream.flush()
@@ -552,12 +568,24 @@ def _storage_utility_shell(
 
 
 def _storage_shell(
-    runner: Any, config: Any, fixture: Fixture, command: str, *, timeout: int = 60
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    command: str,
+    *,
+    timeout: int = 60,
+    node_name: str | None = None,
 ) -> str:
     """Run a PVC command through LoginSet when present, otherwise a utility Pod."""
-    if fixture.login_pod is not None and fixture.login_container is not None:
+    if (
+        node_name is None
+        and fixture.login_pod is not None
+        and fixture.login_container is not None
+    ):
         return _login_shell(runner, config, fixture, command, timeout=timeout)
-    return _storage_utility_shell(runner, config, fixture, command, timeout=timeout)
+    return _storage_utility_shell(
+        runner, config, fixture, command, timeout=timeout, node_name=node_name
+    )
 
 
 def _require_fixture(
@@ -2074,6 +2102,7 @@ def _assert_dataset_state(
     result: Path | None,
     retained_path: str | None,
     storage_prefix: str = "",
+    storage_node: str | None = None,
 ) -> None:
     """Validate cleanup or retention only within scenario-owned paths."""
 
@@ -2096,6 +2125,7 @@ def _assert_dataset_state(
                 f"echo 'missing retained dataset: ' {_shell(retained_storage_path)} >&2; "
                 f"find {_shell(retained_parent)} -maxdepth 2 -printf '%y %p %s\\n' "
                 "2>&1 >&2 || true; exit 1; }",
+                node_name=storage_node,
             )
         return
     paths = list(_execution_targets(result)) if result is not None else []
@@ -2309,6 +2339,31 @@ def _retained_path(result: Path) -> str:
             f"expected one retained generated target, found {targets!r}"
         )
     return targets[0]
+
+
+def _kubectl_execution_node(fixture: Fixture, result: Path) -> str:
+    """Return the selected worker node recorded for a one-cell attempt."""
+    workers = result / "executions" / "0001.workers.tsv"
+    lines = workers.read_text(encoding="utf-8").splitlines()
+    if len(lines) != 1:
+        raise IntegrationTestError(
+            f"expected one selected Kubernetes worker in {workers}, found {lines!r}"
+        )
+    fields = lines[0].split("\t")
+    node, pod, uid, address = fields if len(fields) == 4 else ("", "", "", "")
+    try:
+        valid_address = ipaddress.ip_address(address).version == 4
+    except ValueError:
+        valid_address = False
+    if (
+        node not in fixture.kubectl_nodes
+        or KUBERNETES_DNS_NAME.fullmatch(node) is None
+        or KUBERNETES_DNS_NAME.fullmatch(pod) is None
+        or KUBERNETES_UID.fullmatch(uid) is None
+        or not valid_address
+    ):
+        raise IntegrationTestError(f"malformed Kubernetes worker evidence: {workers}")
+    return node
 
 
 def _kubectl_logical_path(path: str) -> str:
@@ -2928,6 +2983,7 @@ def _kubectl_run_step(
             result,
             runtime.values["retained_data_dir"],
             KUBECTL_STORAGE_MOUNT,
+            _kubectl_execution_node(fixture, result),
         )
     _assert_scenario_report(runner, report_workspace, result, runtime, step, log_dir)
     return result

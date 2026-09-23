@@ -137,6 +137,7 @@ _kubectl_submission = getattr(_FILESYSTEM, "_kubectl_submission")
 _kubectl_lifecycle_state = getattr(_FILESYSTEM, "_kubectl_lifecycle_state")
 _create_generated_inputs = getattr(_FILESYSTEM, "_create_generated_inputs")
 _kubectl_utility_manifest = getattr(_FILESYSTEM, "_kubectl_utility_manifest")
+_kubectl_execution_node = getattr(_FILESYSTEM, "_kubectl_execution_node")
 _override_block = getattr(_FILESYSTEM, "_override_block")
 _require_kubectl_nodes = getattr(_FILESYSTEM, "_require_kubectl_nodes")
 _cleanup_kubectl_attempt = getattr(_FILESYSTEM, "_cleanup_kubectl_attempt")
@@ -259,6 +260,34 @@ def test_kubectl_utility_manifest_is_nonroot_tokenless_and_uses_private_image():
     assert container["imagePullPolicy"] == "Never"
     assert container["image"] == _kubectl_fixture().kubectl_image
     assert container["volumeMounts"][0]["mountPath"] == "/mnt/storage-scale-test"
+    assert spec["nodeSelector"] == {"storage-scale-test/login": "true"}
+
+    pinned = json.loads(
+        _kubectl_utility_manifest("utility-1234abcd", _kubectl_fixture(), "worker-a")
+    )["spec"]
+    assert pinned["nodeName"] == "worker-a"
+    assert "nodeSelector" not in pinned
+
+
+def test_kubectl_retained_probe_requires_owned_worker_evidence(tmp_path):
+    """A retained-data probe cannot schedule from untrusted result metadata."""
+    result = tmp_path / "result"
+    (result / "executions").mkdir(parents=True)
+    workers = result / "executions" / "0001.workers.tsv"
+    workers.write_text(
+        "worker-a\tworker-pod\t01234567-89ab-cdef-0123-456789abcdef\t10.0.0.2\n",
+        encoding="utf-8",
+    )
+    fixture = _kubectl_fixture()
+    fixture.kubectl_nodes = ("worker-a", "worker-b")
+    assert _kubectl_execution_node(fixture, result) == "worker-a"
+
+    workers.write_text(
+        "control-plane\tworker-pod\t01234567-89ab-cdef-0123-456789abcdef\t10.0.0.2\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="malformed"):
+        _kubectl_execution_node(fixture, result)
 
 
 def test_kubectl_target_discovery_rejects_platform_drift():
