@@ -349,6 +349,16 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     script_dir.mkdir(parents=True)
     sweep = script_dir / _SWEEP.name
     shutil.copy2(_SWEEP, sweep)
+    kubectl_dir = script_dir / "kubectl"
+    kubectl_dir.mkdir()
+    shutil.copy2(
+        _REPO_ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh",
+        kubectl_dir / "_nv-elbencho-kubectl-functions.sh",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-coordinator.sh",
+        kubectl_dir / "_nv-elbencho-kubectl-coordinator.sh",
+    )
     root = tmp_path / "data"
     root.mkdir()
     env = tmp_path / "env.sh"
@@ -454,7 +464,6 @@ def test_kubectl_lifecycle_parses_without_current_environment(tmp_path, operatio
         capture_output=True,
     )
     assert result.returncode != 0
-    assert f"kubectl {operation} is not implemented yet" in result.stderr
     assert "Failed to source env.sh" not in result.stdout + result.stderr
 
 
@@ -521,5 +530,4 @@ def test_kubectl_resume_gates_from_saved_snapshot_without_current_env(tmp_path):
         capture_output=True,
     )
     assert result.returncode != 0
-    assert "kubectl resume is not implemented yet" in result.stderr
     assert "Failed to source env.sh" not in result.stdout + result.stderr

@@ -58,7 +58,13 @@ spec:
           image: @@IMAGE@@
           imagePullPolicy: @@IMAGE_PULL_POLICY@@
           command: ["/bin/bash", "-ceu", "--"]
-          args: ["exec /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/control/coordinator.sh"]
+          args:
+            - >-
+              exec /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/control/coordinator.sh
+              /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/control
+              /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/state
+              /tmp/storage-scale-test/@@ATTEMPT_ID@@
+              @@ATTEMPT_ID@@
           env:
             - name: KUBECTL_COORDINATOR_POD_NODE
               valueFrom:

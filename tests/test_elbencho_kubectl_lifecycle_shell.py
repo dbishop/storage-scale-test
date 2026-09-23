@@ -273,11 +273,47 @@ def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:
         test -x "$bundle/coordinator.sh"
         test -f "$bundle/_nv-elbencho-kubectl-functions.sh"
         test -f "$bundle/bundle-manifest.tsv"
+        grep -Eq '^[0-9a-f]{{64}}'$'\t''[^[:space:]]+$' "$bundle/bundle-manifest.tsv"
+        ! grep -Fq '\\t' "$bundle/bundle-manifest.tsv"
         grep -Fx 'attempt_id\t1234abcd' "$bundle/run-metadata.tsv"
         grep -Fx 'output_basename\telbencho-20260922Z123456' "$bundle/run-metadata.tsv"
         ! kubectl_prepare_control_bundle other "$root" "$fd" 1234abcd \\
           elbencho-20260922Z123456 {str(coordinator)!r}
         kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_resume_bundle_keeps_only_collected_non_success_cells(tmp_path: Path) -> None:
+    """A collected resume never sends a previously successful cell back to a Job."""
+    results = tmp_path / "elbencho-20260922Z123456"
+    executions = results / "executions"
+    executions.mkdir(parents=True)
+    for name in ("env_used.sh", "env_used.yaml"):
+        (results / name).write_text("# snapshot\n", encoding="utf-8")
+    (executions / "0001.sh").write_text("export nodes=1\n", encoding="utf-8")
+    (executions / "0002.sh").write_text("export nodes=2\n", encoding="utf-8")
+    endpoints = tmp_path / "endpoints.tsv"
+    endpoints.write_text(
+        "node-a\tuid-a\tpod-a\tpoduid-a\t10.0.0.1\tamd64\tsha256:x\n",
+        encoding="utf-8",
+    )
+    selection = tmp_path / "resume.tsv"
+    selection.write_text("0002\n", encoding="utf-8")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    coordinator = _ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-coordinator.sh"
+    result = _bash(f"""
+        cp {str(_FUNCTIONS)!r} {str(bundle / '_nv-elbencho-kubectl-functions.sh')!r}
+        cp {str(coordinator)!r} {str(bundle / 'coordinator.sh')!r}
+        chmod 700 {str(bundle / 'coordinator.sh')!r}
+        printf 'attempt_id\\t1234abcd\\noutput_basename\\telbencho-20260922Z123456\\n' > {str(bundle / 'run-metadata.tsv')!r}
+        kubectl_populate_sweep_control_bundle {str(bundle)!r} {str(results)!r} \\
+          {str(endpoints)!r} {str(selection)!r}
+        test ! -e {str(bundle / 'executions/0001.sh')!r}
+        test -f {str(bundle / 'executions/0002.sh')!r}
+        grep -F $'\\texecutions/0002.sh' {str(bundle / 'bundle-manifest.tsv')!r}
+        ! grep -Fq 'executions/0001.sh' {str(bundle / 'bundle-manifest.tsv')!r}
         """)
     assert result.returncode == 0, result.stderr
 

@@ -286,15 +286,17 @@ _select_operation() {
 
 _select_operation || exit 1
 
-# Kubernetes lifecycle operations deliberately remain unreachable until their
-# remote state machine lands. They still parse without sourcing env.sh so a
-# stale or broken current configuration cannot alter their saved-attempt path.
-case "$SWEEP_OPERATION" in
-    status|cancel|collect)
-        echo "Error: kubectl $SWEEP_OPERATION is not implemented yet" >&2
-        exit 1
-        ;;
-esac
+# The Kubernetes lifecycle is intentionally sourced from the deployment, not
+# from env.sh.  Keep it lazy so legacy SSH/Slurm deployment tests need not
+# carry Kubernetes-only files.  --status/--cancel/--collect call this before
+# consulting env.sh, so a changed current configuration cannot retarget a Job.
+_source_kubectl_lifecycle_helpers() {
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/kubectl/_nv-elbencho-kubectl-functions.sh" || {
+        echo "Error: Kubernetes lifecycle helpers are missing from this deployment" >&2
+        return 1
+    }
+}
 
 # Inspect and restore the saved configuration before consulting today's
 # env.sh. New snapshots carry their substrate. A legacy snapshot may use only
@@ -356,10 +358,20 @@ _resume_prepare_saved_snapshot() {
 if [[ "$SWEEP_OPERATION" == resume ]]; then
     _resume_prepare_saved_snapshot "$resume_dir"
     if [[ "$SAVED_EXECUTION_SUBSTRATE" == kubectl ]]; then
-        echo "Error: kubectl resume is not implemented yet" >&2
-        exit 1
+        _source_kubectl_lifecycle_helpers || exit 1
+        kubectl_resume_collected_sweep "$OUTPUT_DIR" || exit 1
+        exit 0
     fi
 fi
+
+case "$SWEEP_OPERATION" in
+    status|cancel|collect)
+        _source_kubectl_lifecycle_helpers || exit 1
+        kubectl_lifecycle_operation "$SWEEP_OPERATION" \
+            "${status_dir:-${cancel_dir:-$collect_dir}}"
+        exit $?
+        ;;
+esac
 
 if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
@@ -535,11 +547,6 @@ if [[ -n "$resume_dir" ]]; then
     exit 1
 fi
 
-if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-    echo "Error: kubectl execution is not implemented yet" >&2
-    exit 1
-fi
-
 _validate_elbencho_sweep_environment || exit 1
 
 # Mutual exclusivity of path modes
@@ -666,6 +673,12 @@ if ! reify_all_elbencho_executions "$OUTPUT_DIR" "$nodes_spec" \
         "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from"; then
     echo "Error: failed to reify executions" >&2
     exit 1
+fi
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    _source_kubectl_lifecycle_helpers || exit 1
+    kubectl_submit_sweep "$OUTPUT_DIR" "$max_node_count" || exit 1
+    exit 0
 fi
 
 # Dispatch: SLURM submits one coordinator sbatch and tails its log; SSH
