@@ -58,7 +58,11 @@ Slurm is the default execution substrate; `SSH_HOST_LIST` selects passwordless
 SSH. Kubernetes benchmark execution is not implemented. The `integration-tests/`
 fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
 Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
-static volumes over a repository-shared path. Both test the same storage contract.
+static volumes over a repository-shared path. NFS retains pinned Kindnet;
+Docker SBX uses pinned, preloaded Calico because its nested kernel cannot run
+Kindnet's nftables policy path. Setup proves non-root Elbencho DaemonSet
+placement, direct Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access
+before provisioning the existing SSH and Slurm workloads.
 
 One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
 image tags transactionally, grows retained filesystems, checks fixture and Docker
