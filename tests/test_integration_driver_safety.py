@@ -155,6 +155,7 @@ _run_kubectl_command = getattr(_FILESYSTEM, "_run_kubectl_command")
 _wait_for_kubectl_terminal_state = getattr(
     _FILESYSTEM, "_wait_for_kubectl_terminal_state"
 )
+IntegrationTestError = getattr(_FILESYSTEM, "IntegrationTestError")
 
 
 def test_scenario_listing_short_circuits_before_privileged_state(monkeypatch, capsys):
@@ -455,6 +456,65 @@ def test_kubectl_command_accepts_only_declared_terminal_failure(tmp_path):
         accepted_states=frozenset({"FAILED"}),
     )
     assert _kubectl_lifecycle_state(output) == "FAILED"
+
+
+def test_kubectl_command_rejects_zero_exit_for_declared_failure(tmp_path):
+    """A failed durable ledger must still propagate a failing CLI status."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stderr="",
+            )
+
+    with pytest.raises(IntegrationTestError, match="must return nonzero"):
+        _run_kubectl_command(
+            _Runner(),
+            config,
+            runtime,
+            "collect",
+            ("--collect", "/tmp/results"),
+            logs,
+            30,
+            accepted_states=frozenset({"FAILED"}),
+        )
+
+
+def test_failed_kubectl_submit_arms_exact_lifecycle_cleanup(tmp_path):
+    """A retained PREPARED submit is discoverable before workspace cleanup."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    result_base = workspace / "results" / "baseline"
+    attempt_root = result_base / "elbencho-test"
+    (attempt_root / "kubernetes").mkdir(parents=True)
+    (attempt_root / "kubernetes/current-attempt").write_text(
+        "1234abcd\n", encoding="utf-8"
+    )
+    runtime = SimpleNamespace(
+        workspace=str(workspace),
+        values={"kubectl_result_base": str(result_base)},
+    )
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="submit failed")
+
+    with pytest.raises(IntegrationTestError, match="failed with exit code"):
+        _run_kubectl_command(
+            _Runner(), config, runtime, "baseline", ("--nodes", "1"), logs, 30
+        )
+    assert runtime.values["kubectl_result_root"] == str(attempt_root)
 
 
 def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatch):

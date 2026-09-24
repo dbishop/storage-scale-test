@@ -75,7 +75,11 @@ def _probe_server(response: bytes | None, delay: float = 0) -> Iterator[None]:
 
 @pytest.mark.parametrize(
     ("response", "expected_rc"),
-    ((b"HTTP/1.0 200 OK\r\n\r\n", 0), (b"HTTP/1.0 503 Busy\r\n\r\n", 1)),
+    (
+        (b"HTTP/1.0 200 OK\r\n\r\n", 0),
+        (b"HTTP/1.0 503 Busy\r\n\r\n", 1),
+        (b"garbage 200 text\r\n", 1),
+    ),
 )
 def test_probe_endpoint_uses_real_http_result(
     response: bytes, expected_rc: int

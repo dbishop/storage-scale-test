@@ -33,6 +33,8 @@ readonly KUBECTL_COLLECTION_MAX_BYTES=$((2 * 1024 * 1024 * 1024))
 readonly KUBECTL_COLLECTION_MAX_MEMBERS=50000
 readonly KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT=7200
 readonly KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS_DEFAULT=120
+readonly KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT=30
+readonly KUBECTL_CREATION_ABSENCE_RECHECK_SECONDS_DEFAULT=2
 declare -gA KUBECTL_LOCAL_LOCK_ROOTS=()
 
 kubectl_normalize_logical_path() {
@@ -554,7 +556,9 @@ kubectl_render_template() {
 kubectl_run_bounded() {
     local request_timeout="${KUBECTL_REQUEST_TIMEOUT_SECONDS:-20}"
     local process_timeout="${KUBECTL_PROCESS_TIMEOUT_SECONDS:-30}"
-    timeout --foreground --kill-after=5s "${process_timeout}s" \
+    # Keep kubectl in timeout's child process group. In particular, a wedged
+    # exec stream can otherwise survive TERM while timeout waits in foreground.
+    timeout --kill-after=5s "${process_timeout}s" \
         kubectl --request-timeout="${request_timeout}s" "$@"
 }
 
@@ -774,6 +778,46 @@ kubectl_attempt_clear_creation_intent() {
     [[ ! -e "$intent_file" && ! -L "$intent_file" ]] || rm -f -- "$intent_file"
 }
 
+kubectl_cleanup_creation_intent() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_key="$4"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] \
+        && _kubectl_validate_resource_key "$resource_key" || return 1
+    local intent_file="$kubernetes_dir/attempts/$attempt_id/creation-intents/$resource_key.sh"
+    kubectl_attempt_load_creation_intent "$intent_file" || return 1
+    local observed_uid
+    observed_uid=$(kubectl_run_bounded -n "$KUBECTL_INTENT_NAMESPACE" \
+        get "$KUBECTL_INTENT_KIND" "$KUBECTL_INTENT_NAME" --ignore-not-found \
+        -o 'jsonpath={.metadata.uid}') || return 1
+    if [[ -z "$observed_uid" ]]; then
+        # A timed-out create request can still be finishing in the API server.
+        # Do not erase its only recovery identity until the create's process
+        # deadline has elapsed and a later linearizable GET also sees absence.
+        local intent_epoch now remaining
+        intent_epoch=$(stat -c %Y -- "$intent_file") || return 1
+        now=$(date +%s) || return 1
+        [[ "$intent_epoch" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ \
+            && "$now" -ge "$intent_epoch" ]] || return 1
+        remaining=$((KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT - now + intent_epoch))
+        (( remaining <= 0 )) || sleep "$remaining"
+        sleep "$KUBECTL_CREATION_ABSENCE_RECHECK_SECONDS_DEFAULT"
+        observed_uid=$(kubectl_run_bounded -n "$KUBECTL_INTENT_NAMESPACE" \
+            get "$KUBECTL_INTENT_KIND" "$KUBECTL_INTENT_NAME" --ignore-not-found \
+            -o 'jsonpath={.metadata.uid}') || return 1
+    fi
+    if [[ -n "$observed_uid" ]]; then
+        kubectl_verify_object_identity "$KUBECTL_INTENT_KIND" \
+            "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
+            "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid" >/dev/null \
+            && kubectl_delete_owned_object "$KUBECTL_INTENT_KIND" \
+                "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
+                "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid" \
+            || return 1
+    fi
+    kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+        "$attempt_id" "$resource_key"
+}
+
 kubectl_attempt_load_resource() {
     local kubernetes_dir="$1" attempt_id="$2" resource_key="$3"
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] \
@@ -806,12 +850,27 @@ kubectl_attempt_journal_step() {
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && "$step" =~ ^[a-z][a-z0-9-]{0,61}$ ]] \
         || return 1
     local steps_dir="$kubernetes_dir/attempts/$attempt_id/cleanup"
-    mkdir -p "$steps_dir" || return 1
-    local tmp="$steps_dir/$step.tmp.${BASHPID:-$$}.$RANDOM"
-    if ! : > "$tmp" || ! mv -n "$tmp" "$steps_dir/$step" 2>/dev/null \
-            || [[ -e "$tmp" ]]; then
+    local step_path="$steps_dir/$step"
+    if [[ -e "$steps_dir" || -L "$steps_dir" ]]; then
+        [[ -d "$steps_dir" && ! -L "$steps_dir" ]] || return 1
+    else
+        mkdir "$steps_dir" || return 1
+    fi
+    # Cleanup is deliberately retryable. A caller can be killed after this
+    # marker is published but before its next lifecycle transition; seeing the
+    # same regular marker again proves that step was already committed.
+    if [[ -e "$step_path" || -L "$step_path" ]]; then
+        [[ -f "$step_path" && ! -L "$step_path" ]]
+        return
+    fi
+    local tmp="$step_path.tmp.${BASHPID:-$$}.$RANDOM"
+    if ! : > "$tmp" || ! mv -n "$tmp" "$step_path" 2>/dev/null; then
         rm -f -- "$tmp"
         return 1
+    fi
+    if [[ -e "$tmp" ]]; then
+        rm -f -- "$tmp"
+        [[ -f "$step_path" && ! -L "$step_path" ]] || return 1
     fi
 }
 
@@ -958,6 +1017,11 @@ kubectl_validate_runtime_configuration() {
         echo "Error: invalid Kubernetes filesystem sweep configuration" >&2
         return 1
     fi
+    if [[ "$KUBECTL_IMAGE_PULL_POLICY" == Always \
+            && ! "$KUBECTL_ELBENCHO_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]; then
+        echo "Error: KUBECTL_IMAGE_PULL_POLICY=Always requires a digest-qualified KUBECTL_ELBENCHO_IMAGE" >&2
+        return 1
+    fi
 }
 
 kubectl_get_object_uid() {
@@ -995,11 +1059,11 @@ kubectl_validate_cluster_identity() {
 }
 
 kubectl_validate_runtime_pod() {
-    # Validate the configured image and PVC identity under the actual workload
-    # UID/GID. This creates no durable attempt state and always deletes only
-    # the exact helper it created.
+    # Use a deadline-bounded, TTL-cleaned Job so SIGKILL of the local validator
+    # cannot leave an unjournaled sleeping Pod. The Job validates the image,
+    # workload identity, command contract, and actual PVC write/read/remove.
     kubectl_validate_cluster_identity >/dev/null || return 1
-    local nodes_dir nodes_path helper_uid attempt_id nonce operation_token node helper_name rc=0
+    local nodes_dir nodes_path helper_uid attempt_id nonce node helper_name manifest rc=0
     nodes_dir=$(mktemp -d "${TMPDIR:-/tmp}/storage-scale-test-kubectl-nodes.XXXXXX") || return 1
     nodes_path="$nodes_dir/nodes.tsv"
     kubectl_discover_candidate_nodes "$KUBECTL_NODE_SELECTOR" "$nodes_path" || {
@@ -1013,40 +1077,37 @@ kubectl_validate_runtime_pod() {
     rm -rf -- "$nodes_dir"
     attempt_id=$(kubectl_generate_attempt_id) || return 1
     nonce=$(kubectl_generate_ownership_nonce) || return 1
-    operation_token=$(_kubectl_random_hex 4) || return 1
-    helper_name="sst-elb-$attempt_id-status-$operation_token"
-    if ! kubectl_create_helper_pod helper_uid status "$KUBECTL_NAMESPACE" "$helper_name" \
-            "$nonce" "$attempt_id" "$node" "$operation_token"; then
-        [[ -z "${helper_uid:-}" ]] || kubectl_delete_owned_object Pod "$helper_name" \
-            "$KUBECTL_NAMESPACE" "$nonce" "$attempt_id" "$helper_uid" || true
-        return 1
+    helper_name="sst-elb-$attempt_id-validation"
+    manifest=$(kubectl_render_attempt_template \
+        "$(kubectl_template_directory)/validation-job.yaml.tmpl" \
+        "NAMESPACE=$KUBECTL_NAMESPACE" "RESOURCE_NAME=$helper_name" \
+        "ATTEMPT_ID=$attempt_id" "OWNERSHIP_NONCE=$nonce" \
+        "IMAGE=$KUBECTL_ELBENCHO_IMAGE" "IMAGE_PULL_POLICY=$KUBECTL_IMAGE_PULL_POLICY" \
+        "RUN_AS_USER=$KUBECTL_RUN_AS_USER" "RUN_AS_GROUP=$KUBECTL_RUN_AS_GROUP" \
+        "PVC_NAME=$KUBECTL_PVC" "NODE_NAME=$node") || return 1
+    kubectl_create_owned_object helper_uid Job "$helper_name" "$KUBECTL_NAMESPACE" \
+        "$nonce" "$attempt_id" "$manifest" || return 1
+    local deadline=$((SECONDS + 180)) terminal="" wait_rc
+    while (( SECONDS < deadline )); do
+        wait_rc=0
+        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=15 \
+            kubectl_job_terminal_state terminal "$helper_name" "$KUBECTL_NAMESPACE" \
+                "$nonce" "$attempt_id" "$helper_uid" || wait_rc=$?
+        [[ "$wait_rc" -eq 0 ]] && break
+        [[ "$wait_rc" -eq 2 ]] || { rc=1; break; }
+        sleep 1
+    done
+    if [[ "$terminal" != COMPLETE ]]; then
+        echo "Error: Kubernetes runtime validation Job did not complete successfully" >&2
+        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=20 \
+            kubectl_run_bounded -n "$KUBECTL_NAMESPACE" logs "job/$helper_name" \
+                --all-containers=true --tail=200 >&2 || true
+        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=20 \
+            kubectl_run_bounded -n "$KUBECTL_NAMESPACE" describe Job "$helper_name" \
+                >&2 || true
+        rc=1
     fi
-    # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    kubectl_pvc_exec "$KUBECTL_NAMESPACE" "$helper_name" /bin/bash -ceu '
-        test "$(id -u)" = "$1"
-        test "$(id -g)" = "$2"
-        # This is the complete external-command contract of the
-        # digest-verified coordinator and its elbencho helper library. Keep
-        # this preflight in lockstep with coordinator changes so a Job cannot
-        # fail only after durable state has been prepared.
-        for command in \
-            elbencho bash tar realpath timeout sha256sum awk find grep mkdir cp \
-            cmp date shuf mv wc cat sed rm sort basename dirname sleep mktemp \
-            tr xargs rmdir id cut od; do
-            command -v "$command"
-        done
-        if ! type -P stat >/dev/null 2>&1 \
-                && ! type -P gstat >/dev/null 2>&1; then
-            exit 1
-        fi
-        if ! type -P pkill >/dev/null 2>&1 \
-                && ! type -P killall >/dev/null 2>&1; then
-            exit 1
-        fi
-        test -x /usr/bin/elbencho
-        test -r /mnt/storage-scale-test && test -w /mnt/storage-scale-test
-    ' bash "$KUBECTL_RUN_AS_USER" "$KUBECTL_RUN_AS_GROUP" || rc=1
-    kubectl_delete_owned_object Pod "$helper_name" "$KUBECTL_NAMESPACE" "$nonce" \
+    kubectl_delete_owned_object Job "$helper_name" "$KUBECTL_NAMESPACE" "$nonce" \
         "$attempt_id" "$helper_uid" || rc=1
     return "$rc"
 }
@@ -1263,12 +1324,14 @@ kubectl_reserve_remote_attempt() {
         root_real=$(realpath -m -- "$root") || exit 1
         [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
         umask 077
-        made_lock=0 made_run=0
+        pending="$lock.pending.$attempt.$nonce"
+        made_pending=0 made_lock=0 made_run=0
         cleanup() {
             [[ $made_run -eq 0 ]] || rm -rf -- "$run"
             [[ $made_lock -eq 0 ]] || rm -rf -- "$lock"
+            [[ $made_pending -eq 0 ]] || rm -rf -- "$pending"
         }
-        trap cleanup ERR
+        trap cleanup EXIT
         for path in "$root" "$root/locks" "$root/runs"; do
             if [[ -e "$path" || -L "$path" ]]; then
                 [[ -d "$path" && ! -L "$path" ]] || exit 1
@@ -1278,15 +1341,20 @@ kubectl_reserve_remote_attempt() {
         done
         root_real=$(realpath -e -- "$root") || exit 1
         [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
-        mkdir -- "$lock"
+        # Publish a fully initialized lock directory in one same-filesystem
+        # rename. A killed writer must never leave the canonical lock without
+        # the identity needed by exact recovery.
+        [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
+        mkdir -- "$pending"
+        made_pending=1
+        printf "%s\\t%s\\n" "$attempt" "$nonce" > "$pending/owner"
+        mv -T -n -- "$pending" "$lock"
+        [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
+        made_pending=0
         made_lock=1
-        owner="$lock/owner"
-        tmp="$lock/.owner.$$"
-        printf "%s\\t%s\\n" "$attempt" "$nonce" > "$tmp"
-        mv -- "$tmp" "$owner"
         mkdir -- "$run"
         made_run=1
-        trap - ERR
+        trap - EXIT
     ' bash "$lock_dir" "$remote_run" "$attempt_id" "$nonce"
 }
 
@@ -1372,12 +1440,32 @@ kubectl_release_remote_attempt() {
         kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
             lock=$1 run=$2 attempt=$3 nonce=$4
             expected=$(printf "%s\\t%s" "$attempt" "$nonce")
+            pending="$lock.pending.$attempt.$nonce"
             case "$run" in /mnt/storage-scale-test/.storage-scale-test/runs/????????) ;; *) exit 1 ;; esac
             mount=/mnt/storage-scale-test
             root=$mount/.storage-scale-test
             mount_real=$(realpath -e -- "$mount") || exit 1
+            if [[ ! -e "$root" && ! -L "$root" ]]; then
+                [[ ! -e "$pending" && ! -L "$pending" \
+                    && ! -e "$lock" && ! -L "$lock" \
+                    && ! -e "$run" && ! -L "$run" ]]
+                exit
+            fi
+            [[ -d "$root" && ! -L "$root" ]] || exit 1
             root_real=$(realpath -e -- "$root") || exit 1
             [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+            if [[ -e "$pending" || -L "$pending" ]]; then
+                [[ -d "$pending" && ! -L "$pending" ]] || exit 1
+                if [[ -e "$pending/owner" || -L "$pending/owner" ]]; then
+                    [[ -f "$pending/owner" && ! -L "$pending/owner" \
+                        && $(cat -- "$pending/owner") == "$expected" \
+                        && $(find "$pending" -mindepth 1 -maxdepth 1 -printf . | wc -c) -eq 1 ]] \
+                        || exit 1
+                    rm -- "$pending/owner" || exit 1
+                fi
+                rmdir -- "$pending"
+                [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
+            fi
             if [[ ! -e "$lock" && ! -L "$lock" && ! -e "$run" && ! -L "$run" ]]; then
                 exit 0
             fi
@@ -1406,13 +1494,32 @@ kubectl_release_remote_attempt() {
         kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
             lock=$1 run=$2 attempt=$3 nonce=$4
             expected=$(printf "%s\\t%s" "$attempt" "$nonce")
+            pending="$lock.pending.$attempt.$nonce"
             [[ ! -e "$run" && ! -L "$run" ]] || exit 1
+            if [[ -e "$pending" || -L "$pending" ]]; then
+                [[ -d "$pending" && ! -L "$pending" ]] || exit 1
+                if [[ -e "$pending/owner" || -L "$pending/owner" ]]; then
+                    [[ -f "$pending/owner" && ! -L "$pending/owner" \
+                        && $(cat -- "$pending/owner") == "$expected" \
+                        && $(find "$pending" -mindepth 1 -maxdepth 1 -printf . | wc -c) -eq 1 ]] \
+                        || exit 1
+                    rm -- "$pending/owner" || exit 1
+                fi
+                rmdir -- "$pending"
+                [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
+            fi
             if [[ ! -e "$lock" && ! -L "$lock" ]]; then
                 exit 0
             fi
             mount=/mnt/storage-scale-test
             root=$mount/.storage-scale-test
             mount_real=$(realpath -e -- "$mount") || exit 1
+            if [[ ! -e "$root" && ! -L "$root" ]]; then
+                [[ ! -e "$pending" && ! -L "$pending" \
+                    && ! -e "$lock" && ! -L "$lock" ]]
+                exit
+            fi
+            [[ -d "$root" && ! -L "$root" ]] || exit 1
             root_real=$(realpath -e -- "$root") || exit 1
             [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
             [[ -d "$lock" && ! -L "$lock" ]] || exit 1
@@ -1732,21 +1839,24 @@ kubectl_job_terminal_state() {
 kubectl_wait_journaled_job_quiescent() {
     local kubernetes_dir="$1" attempt_id="$2"
     local timeout_seconds="${3:-${KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS:-$KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS_DEFAULT}}"
-    [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+    local allow_absent="${4:-0}"
+    [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ && "$allow_absent" =~ ^[01]$ ]] || return 1
     kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep || return 1
     [[ "$KUBECTL_RESOURCE_KIND" == Job ]] || return 1
     local deadline=$((SECONDS + timeout_seconds)) remaining observed_uid="" terminal_state="" rc
     while (( SECONDS < deadline )); do
         remaining=$((deadline - SECONDS))
-        if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" delete-sweep; then
-            observed_uid=$(KUBECTL_REQUEST_TIMEOUT_SECONDS=$((remaining < 10 ? remaining : 10)) \
-                KUBECTL_PROCESS_TIMEOUT_SECONDS="$remaining" \
-                kubectl_run_bounded -n "$KUBECTL_RESOURCE_NAMESPACE" get Job \
-                    "$KUBECTL_RESOURCE_NAME" --ignore-not-found \
-                    -o 'jsonpath={.metadata.uid}') || return 1
-            [[ -z "$observed_uid" ]] && return 0
-            [[ "$observed_uid" == "$KUBECTL_RESOURCE_UID" ]] || return 1
+        observed_uid=$(KUBECTL_REQUEST_TIMEOUT_SECONDS=$((remaining < 10 ? remaining : 10)) \
+            KUBECTL_PROCESS_TIMEOUT_SECONDS="$remaining" \
+            kubectl_run_bounded -n "$KUBECTL_RESOURCE_NAMESPACE" get Job \
+                "$KUBECTL_RESOURCE_NAME" --ignore-not-found \
+                -o 'jsonpath={.metadata.uid}') || return 1
+        if [[ -z "$observed_uid" ]]; then
+            [[ "$allow_absent" -eq 1 ]] \
+                || kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" delete-sweep
+            return
         fi
+        [[ "$observed_uid" == "$KUBECTL_RESOURCE_UID" ]] || return 1
         rc=0
         KUBECTL_REQUEST_TIMEOUT_SECONDS=$((remaining < 10 ? remaining : 10)) \
             KUBECTL_PROCESS_TIMEOUT_SECONDS="$remaining" \
@@ -1873,6 +1983,43 @@ _kubectl_safe_archive_member() {
     for component in "${components[@]}"; do
         [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
     done
+}
+
+_kubectl_safe_relative_file_path() {
+    local path="$1"
+    [[ "$path" != */ ]] && _kubectl_safe_archive_member "$path"
+}
+
+_kubectl_result_destination() {
+    local output_name="$1" results_dir="$2" relative="$3" create_parents="$4"
+    [[ "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
+        && "$create_parents" =~ ^[01]$ ]] || return 1
+    _kubectl_safe_relative_file_path "$relative" \
+        && _kubectl_validate_local_directory_path "$results_dir" \
+        && [[ -d "$results_dir" && ! -L "$results_dir" ]] || return 1
+    local results_real current component index
+    results_real=$(realpath -e -- "$results_dir") || return 1
+    current="$results_dir"
+    local -a components=()
+    IFS=/ read -ra components <<< "$relative"
+    for ((index = 0; index + 1 < ${#components[@]}; index++)); do
+        component="${components[$index]}"
+        current="$current/$component"
+        if [[ -e "$current" || -L "$current" ]]; then
+            [[ -d "$current" && ! -L "$current" ]] || return 1
+        elif [[ "$create_parents" -eq 1 ]]; then
+            mkdir -- "$current" || return 1
+        else
+            printf -v "$output_name" '%s' "$results_dir/$relative"
+            return 0
+        fi
+    done
+    local parent_real resolved_destination="$results_dir/$relative"
+    parent_real=$(realpath -e -- "$current") || return 1
+    [[ "$parent_real" == "$results_real" || "$parent_real" == "$results_real/"* ]] \
+        || return 1
+    [[ ! -L "$resolved_destination" ]] || return 1
+    printf -v "$output_name" '%s' "$resolved_destination"
 }
 
 kubectl_validate_attempt_archive() {
@@ -2164,7 +2311,7 @@ kubectl_upload_control_bundle() {
 kubectl_cleanup_journaled_resources() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
-    local key resource_file intent_file primary_rc=0 rc observed_uid
+    local key resource_file intent_file primary_rc=0 rc
     for intent_file in "$kubernetes_dir/attempts/$attempt_id/creation-intents"/*.sh; do
         [[ -e "$intent_file" || -L "$intent_file" ]] || continue
         if [[ ! -f "$intent_file" || -L "$intent_file" ]]; then
@@ -2174,31 +2321,10 @@ kubectl_cleanup_journaled_resources() {
             continue
         fi
         key=$(basename "$intent_file" .sh)
-        kubectl_attempt_load_creation_intent "$intent_file" || {
-            printf 'Error: corrupt Kubernetes creation intent for %s\n' "$key" >&2
-            primary_rc=1
-            continue
-        }
-        observed_uid=$(kubectl_run_bounded -n "$KUBECTL_INTENT_NAMESPACE" \
-            get "$KUBECTL_INTENT_KIND" "$KUBECTL_INTENT_NAME" --ignore-not-found \
-            -o 'jsonpath={.metadata.uid}') || {
-                primary_rc=1
-                continue
-            }
-        if [[ -z "$observed_uid" ]]; then
-            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
-                "$attempt_id" "$key" || primary_rc=1
-            continue
-        fi
-        if kubectl_verify_object_identity "$KUBECTL_INTENT_KIND" \
-                "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
-                "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid" \
-                && kubectl_delete_owned_object "$KUBECTL_INTENT_KIND" \
-                    "$KUBECTL_INTENT_NAME" "$KUBECTL_INTENT_NAMESPACE" \
-                    "$KUBECTL_INTENT_NONCE" "$attempt_id" "$observed_uid"; then
-            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
-                "$attempt_id" "$key" || primary_rc=1
-        else
+        if ! kubectl_cleanup_creation_intent "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" "$key"; then
+            printf 'Error: failed to reconcile Kubernetes creation intent for %s\n' \
+                "$key" >&2
             primary_rc=1
         fi
     done
@@ -2608,8 +2734,18 @@ _kubectl_remove_inspector() {
 }
 
 kubectl_cleanup_ephemeral_helpers() {
-    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_file key
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_file intent_file key
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    # A killed helper creation can leave only its pre-create intent. Reconcile
+    # those exact ephemeral names before scanning the UID-bearing journals;
+    # core attempt intents remain for the full rollback/collection path.
+    for intent_file in "$kubernetes_dir/attempts/$attempt_id/creation-intents"/{status,collector}-*.sh; do
+        [[ -e "$intent_file" || -L "$intent_file" ]] || continue
+        [[ -f "$intent_file" && ! -L "$intent_file" ]] || return 1
+        key=$(basename "$intent_file" .sh)
+        kubectl_cleanup_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$attempt_id" "$key" || return 1
+    done
     for resource_file in "$kubernetes_dir/attempts/$attempt_id/resources"/{status,collector}-*.sh; do
         [[ -f "$resource_file" && ! -L "$resource_file" ]] || continue
         key=$(basename "$resource_file" .sh)
@@ -2769,7 +2905,9 @@ kubectl_lifecycle_operation() {
         local collected_terminal=""
         _kubectl_validate_collected_publication \
             "$kubernetes_dir/attempts/$attempt_id/collected-state" "$attempt_id" \
-            collected_terminal >/dev/null || rc=1
+            collected_terminal \
+            "$kubernetes_dir/attempts/$attempt_id/control-bundle/executions" \
+            >/dev/null || rc=1
         kubectl_local_lock_release "$lock_fd" || rc=1
         [[ "$rc" -eq 0 ]] || return "$rc"
         kubectl_emit_state "$collected_terminal"
@@ -2795,20 +2933,29 @@ kubectl_lifecycle_operation() {
         kubectl_emit_state SUBMISSION_FAILED
         [[ "$operation" != collect ]] || rc=1
     elif [[ "$rc" -eq 0 && "$operation" == status ]]; then
-        # A submitted attempt must still have the exact journaled Job.  A
-        # terminal/collected attempt may have deliberately released it; do not
-        # let a broad label query silently adopt a replacement.
-        if [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
-            kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep \
-                && kubectl_verify_object_identity "$KUBECTL_RESOURCE_KIND" \
-                    "$KUBECTL_RESOURCE_NAME" "$KUBECTL_RESOURCE_NAMESPACE" \
-                    "$KUBECTL_RESOURCE_NONCE" "$attempt_id" "$KUBECTL_RESOURCE_UID" >/dev/null \
-                || rc=1
-        fi
         [[ "$rc" -ne 0 ]] || _kubectl_create_inspector inspector inspector_uid status \
             "$kubernetes_dir" "$lock_fd" "$attempt_id" || rc=1
         [[ "$rc" -ne 0 ]] || remote_state=$(kubectl_read_remote_status "$KUBECTL_NAMESPACE" \
             "$inspector" "$attempt_id") || rc=1
+        local job_state="" job_rc=0 observed_job_uid="" job_missing=0
+        if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
+            kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep || rc=1
+            if [[ "$rc" -eq 0 ]]; then
+                kubectl_job_terminal_state job_state "$KUBECTL_RESOURCE_NAME" \
+                    "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_NONCE" \
+                    "$attempt_id" "$KUBECTL_RESOURCE_UID" || job_rc=$?
+            fi
+            if [[ "$rc" -eq 0 && "$job_rc" -eq 1 ]]; then
+                observed_job_uid=$(kubectl_run_bounded -n "$KUBECTL_RESOURCE_NAMESPACE" \
+                    get Job "$KUBECTL_RESOURCE_NAME" --ignore-not-found \
+                    -o 'jsonpath={.metadata.uid}') || rc=1
+                if [[ "$rc" -eq 0 && -z "$observed_job_uid" ]]; then
+                    job_missing=1
+                elif [[ "$rc" -eq 0 ]]; then
+                    rc=1
+                fi
+            fi
+        fi
         if [[ "$rc" -eq 0 && "$remote_state" =~ ^(PREPARED|RUNNING)$ \
                 && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
             # Endpoint identity is the more specific failure evidence.  Check
@@ -2822,14 +2969,25 @@ kubectl_lifecycle_operation() {
                     "$lock_fd" "$inspector" "$attempt_id") || rc=1
             elif [[ "$endpoint_rc" -ne 0 ]]; then
                 rc="$endpoint_rc"
-            elif kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep \
-                    && kubectl_job_is_terminal_failure Job "$KUBECTL_RESOURCE_NAME" \
-                        "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_NONCE" \
-                        "$attempt_id" "$KUBECTL_RESOURCE_UID"; then
+            elif [[ ( "$job_rc" -eq 0 && "$job_state" == FAILED ) \
+                    || "$job_missing" -eq 1 ]]; then
                 kubectl_recover_lost_coordinator "$KUBECTL_NAMESPACE" "$inspector" \
                     "$attempt_id" || rc=1
                 [[ "$rc" -ne 0 ]] || remote_state=$(kubectl_read_remote_status \
                     "$KUBECTL_NAMESPACE" "$inspector" "$attempt_id") || rc=1
+            elif [[ "$job_rc" -eq 0 ]]; then
+                echo "Error: completed Kubernetes Job lacks terminal durable state" >&2
+                rc=1
+            fi
+        elif [[ "$rc" -eq 0 && "$remote_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ \
+                && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
+            # A failed Job may die after committing terminal run.status but
+            # before replacing the summary or publication manifest. Repair
+            # that bounded window before reporting terminal durability.
+            if [[ ( "$job_rc" -eq 0 && "$job_state" == FAILED ) \
+                    || "$job_missing" -eq 1 ]]; then
+                kubectl_recover_lost_coordinator "$KUBECTL_NAMESPACE" "$inspector" \
+                    "$attempt_id" || rc=1
             fi
         fi
         [[ -z "${inspector:-}" ]] || _kubectl_remove_inspector "$kubernetes_dir" \
@@ -2855,24 +3013,52 @@ kubectl_lifecycle_operation() {
 }
 
 _kubectl_validate_collected_publication() {
-    local state_dir="$1" attempt_id="$2" output_name="$3"
+    local state_dir="$1" attempt_id="$2" output_name="$3" definitions_dir="$4"
     local manifest="$state_dir/publication-manifest.tsv" line kind first second third fourth fifth extra
     [[ -d "$state_dir" && ! -L "$state_dir" && -f "$manifest" && ! -L "$manifest" \
+        && -d "$definitions_dir" && ! -L "$definitions_dir" \
         && "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
-    local terminal="" saw_schema=0 saw_attempt=0
+    local terminal_state="" saw_schema=0 saw_attempt=0
     local -a result_rows=()
+    local -A seen_executions=() execution_states=() seen_sources=()
+    local -A seen_destinations=() source_roles=() source_destinations=()
+    local -A destination_roles=() destination_sources=()
     while IFS= read -r line || [[ -n "$line" ]]; do
         IFS=$'\t' read -r kind first second third fourth fifth extra <<< "$line"
         case "$kind" in
-            schema) [[ "$first" == 1 && -z "${second:-}" ]] || return 1; saw_schema=1 ;;
-            attempt_id) [[ "$first" == "$attempt_id" && -z "${second:-}" ]] || return 1; saw_attempt=1 ;;
-            execution) [[ "$first" =~ ^[0-9]{4}$ && "$second" =~ ^(PENDING|RUNNING|SUCCESS|FAILED)$ \
-                && -z "${third:-}" ]] || return 1 ;;
+            schema)
+                [[ "$saw_schema" -eq 0 && "$first" == 1 && -z "${second:-}" ]] \
+                    || return 1
+                saw_schema=1
+                ;;
+            attempt_id)
+                [[ "$saw_attempt" -eq 0 && "$first" == "$attempt_id" \
+                    && -z "${second:-}" ]] || return 1
+                saw_attempt=1
+                ;;
+            execution)
+                [[ "$first" =~ ^[0-9]{4}$ \
+                    && "$second" =~ ^(PENDING|RUNNING|SUCCESS|FAILED)$ \
+                    && -z "${third:-}" && ! -v seen_executions["$first"] ]] \
+                    || return 1
+                seen_executions["$first"]=1
+                execution_states["$first"]="$second"
+                ;;
             ledger|snapshot|result)
-                [[ "$first" =~ ^[A-Za-z0-9._/-]+$ && "$first" != /* \
-                    && "$second" =~ ^[A-Za-z0-9._/-]+$ && "$second" != /* \
+                [[ "$first" =~ ^[A-Za-z0-9._/-]+$ \
+                    && "$second" =~ ^[A-Za-z0-9._/-]+$ \
                     && "$third" =~ ^[0-9]+$ && "$fourth" =~ ^[0-9a-f]{64}$ \
                     && -z "${fifth:-}" ]] || return 1
+                _kubectl_safe_relative_file_path "$first" \
+                    && _kubectl_safe_relative_file_path "$second" \
+                    && [[ ! -v seen_sources["$first"] \
+                        && ! -v seen_destinations["$second"] ]] || return 1
+                seen_sources["$first"]=1
+                seen_destinations["$second"]=1
+                source_roles["$first"]="$kind"
+                source_destinations["$first"]="$second"
+                destination_roles["$second"]="$kind"
+                destination_sources["$second"]="$first"
                 local source="$state_dir/$first" bytes digest
                 [[ -f "$source" && ! -L "$source" ]] || return 1
                 bytes=$(wc -c < "$source") || return 1
@@ -2884,11 +3070,114 @@ _kubectl_validate_collected_publication() {
         esac
     done < "$manifest"
     [[ "$saw_schema" -eq 1 && "$saw_attempt" -eq 1 ]] || return 1
-    terminal=$(cat "$state_dir/run.status" 2>/dev/null || true)
-    [[ "$terminal" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || return 1
-    printf -v "$output_name" '%s' "$terminal"
+    terminal_state=$(cat "$state_dir/run.status" 2>/dev/null || true)
+    [[ "$terminal_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || return 1
+    local core
+    for core in run.status run-summary.tsv env_used.sh env_used.yaml; do
+        [[ -v source_roles["$core"] \
+            && "${source_destinations[$core]}" == "$core" ]] || return 1
+        if [[ "$core" == env_used.* ]]; then
+            [[ "${source_roles[$core]}" == snapshot ]] || return 1
+        else
+            [[ "${source_roles[$core]}" == ledger ]] || return 1
+        fi
+    done
+    local definition id status exit_path workers_path expected_count=0 failed_count=0
+    local -A expected_executions=()
+    for definition in "$definitions_dir"/[0-9][0-9][0-9][0-9].sh; do
+        [[ -f "$definition" && ! -L "$definition" ]] || continue
+        id=$(basename "$definition" .sh)
+        [[ ! -v expected_executions["$id"] ]] || return 1
+        expected_executions["$id"]=1
+        expected_count=$((expected_count + 1))
+    done
+    [[ "$expected_count" -gt 0 \
+        && "${#seen_executions[@]}" -eq "$expected_count" ]] || return 1
+    for id in "${!seen_executions[@]}"; do
+        [[ -v expected_executions["$id"] ]] || return 1
+    done
+    for id in "${!expected_executions[@]}"; do
+        [[ -v execution_states["$id"] ]] || return 1
+        status="${execution_states[$id]}"
+        [[ "$status" != RUNNING ]] || return 1
+        [[ -v source_roles["executions/$id.status"] \
+            && "${source_roles[executions/$id.status]}" == ledger \
+            && "${source_destinations[executions/$id.status]}" \
+                == "executions/$id.status" \
+            && "$(cat "$state_dir/executions/$id.status")" == "$status" ]] \
+            || return 1
+        exit_path="executions/$id.exitcode"
+        workers_path="executions/$id.workers.tsv"
+        case "$status" in
+            SUCCESS)
+                [[ -v source_roles["$exit_path"] \
+                    && "${source_roles[$exit_path]}" == ledger \
+                    && "${source_destinations[$exit_path]}" == "$exit_path" \
+                    && "$(cat "$state_dir/$exit_path")" == 0 \
+                    && -v source_roles["$workers_path"] \
+                    && "${source_roles[$workers_path]}" == ledger \
+                    && "${source_destinations[$workers_path]}" == "$workers_path" ]] \
+                    || return 1
+                local workload_rc=0
+                _kubectl_execution_requires_workload_metadata \
+                    "$definitions_dir/$id.sh" || workload_rc=$?
+                case "$workload_rc" in
+                    0)
+                        [[ "${destination_roles[executions/$id.workload.tsv]:-}" \
+                            == result \
+                            && "${destination_sources[executions/$id.workload.tsv]:-}" \
+                                == "results/$id/executions/$id.workload.tsv" ]] \
+                            || return 1
+                        ;;
+                    1) ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            FAILED)
+                [[ -v source_roles["$exit_path"] \
+                    && "${source_roles[$exit_path]}" == ledger \
+                    && "${source_destinations[$exit_path]}" == "$exit_path" \
+                    && "$(cat "$state_dir/$exit_path")" =~ ^[1-9][0-9]*$ ]] \
+                    || return 1
+                failed_count=$((failed_count + 1))
+                ;;
+            PENDING) ;;
+            *) return 1 ;;
+        esac
+    done
+    if [[ "$terminal_state" == SUCCESS ]]; then
+        [[ "$failed_count" -eq 0 ]] || return 1
+        for status in "${execution_states[@]}"; do
+            [[ "$status" == SUCCESS ]] || return 1
+        done
+    elif [[ "$terminal_state" == FAILED ]]; then
+        [[ "$failed_count" -gt 0 \
+            || ( "${source_roles[startup-error.txt]:-}" == ledger \
+                && "${source_destinations[startup-error.txt]:-}" == startup-error.txt ) ]] \
+            || return 1
+    fi
+    printf -v "$output_name" '%s' "$terminal_state"
     printf '%s\0' "${result_rows[@]}"
 }
+
+_kubectl_execution_requires_workload_metadata() (
+    # Execution definitions are the immutable local files generated before
+    # submission, not content imported from the PVC. Use the same completion
+    # contract as _elbencho_required_result_artifacts_for_execution().
+    local definition="$1"
+    [[ -f "$definition" && ! -L "$definition" ]] || return 2
+    unset ELBENCHO_SWEEP_READ_FROM ELBENCHO_SINGLE_BIG_FILE
+    unset ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE
+    ELBENCHO_FILE_LAYOUT=worker-directories
+    # shellcheck disable=SC1090
+    source "$definition" || return 2
+    if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
+            && "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
+        return 0
+    fi
+    [[ "${ELBENCHO_FILE_LAYOUT:-worker-directories}" == shared-directory \
+        && -n "${ELBENCHO_FILES_PER_NODE:-}" ]]
+)
 
 _kubectl_merge_collected_results() {
     local state_dir="$1" results_dir="$2"
@@ -2904,12 +3193,14 @@ _kubectl_merge_collected_results() {
         [[ "$kind" != ledger \
             || "$local_path" != executions/[0-9][0-9][0-9][0-9].status ]] \
             || continue
-        [[ -z "${extra:-}" && "$local_path" =~ ^[A-Za-z0-9._/-]+$ \
-            && "$local_path" != /* && "$local_path" != *..* ]] || return 1
-        local source="$state_dir/$remote" destination="$results_dir/$local_path" parent temporary
+        [[ -z "${extra:-}" ]] \
+            && _kubectl_safe_relative_file_path "$remote" \
+            && _kubectl_safe_relative_file_path "$local_path" || return 1
+        local source="$state_dir/$remote" destination parent temporary
         [[ -f "$source" && ! -L "$source" ]] || return 1
+        _kubectl_result_destination destination "$results_dir" "$local_path" 1 \
+            || return 1
         parent=$(dirname "$destination")
-        mkdir -p -- "$parent" || return 1
         if [[ -e "$destination" ]]; then
             [[ -f "$destination" && ! -L "$destination" \
                 && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
@@ -2930,8 +3221,8 @@ _kubectl_merge_collected_results() {
     for source_status in "$state_dir"/executions/[0-9][0-9][0-9][0-9].status; do
         [[ -f "$source_status" && ! -L "$source_status" ]] || continue
         id=$(basename "$source_status" .status)
-        destination_status="$results_dir/executions/$id.status"
-        [[ -d "$results_dir/executions" ]] || return 1
+        _kubectl_result_destination destination_status "$results_dir" \
+            "executions/$id.status" 1 || return 1
         if [[ -e "$destination_status" ]]; then
             [[ -f "$destination_status" && ! -L "$destination_status" ]] || return 1
             if [[ "$(cat "$destination_status")" == SUCCESS ]]; then
@@ -2965,9 +3256,9 @@ _kubectl_remove_superseded_collection_paths() {
         [[ -f "$prior_manifest" && ! -L "$prior_manifest" ]] || continue
         while IFS=$'\t' read -r kind remote local_path bytes digest extra; do
             [[ "$kind" == result || "$kind" == ledger ]] || continue
-            [[ -z "${extra:-}" && "$local_path" =~ ^[A-Za-z0-9._/-]+$ \
-                && "$local_path" != /* && "$local_path" != *..* \
-                && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            [[ -z "${extra:-}" && "$digest" =~ ^[0-9a-f]{64}$ ]] \
+                && _kubectl_safe_relative_file_path "$remote" \
+                && _kubectl_safe_relative_file_path "$local_path" || return 1
             local replace=0 id=""
             if [[ "$remote" =~ ^results/([0-9]{4})/ ]]; then
                 id="${BASH_REMATCH[1]}"
@@ -2980,7 +3271,9 @@ _kubectl_remove_superseded_collection_paths() {
                 replace=1
             fi
             [[ "$replace" -eq 1 ]] || continue
-            local destination="$results_dir/$local_path"
+            local destination
+            _kubectl_result_destination destination "$results_dir" "$local_path" 0 \
+                || return 1
             [[ -e "$destination" ]] || continue
             [[ -f "$destination" && ! -L "$destination" \
                 && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] \
@@ -3001,7 +3294,8 @@ kubectl_collect_attempt() {
             && -d "$metadata_dir/collected-state" ]]; then
         local recovered_terminal=""
         _kubectl_validate_collected_publication "$metadata_dir/collected-state" "$attempt_id" \
-            recovered_terminal >/dev/null || return 1
+            recovered_terminal "$metadata_dir/control-bundle/executions" \
+            >/dev/null || return 1
         # Durable import precedes cleanup. Recover every remaining exact,
         # journaled release/delete step before advertising COLLECTED.
         local recovery_rc=0
@@ -3023,14 +3317,26 @@ kubectl_collect_attempt() {
     fi
     _kubectl_create_inspector inspector inspector_uid collector "$kubernetes_dir" "$lock_fd" "$attempt_id" || return 1
     remote_state=$(kubectl_read_remote_status "$KUBECTL_NAMESPACE" "$inspector" "$attempt_id") || rc=1
-    if [[ "$rc" -eq 0 && "$remote_state" =~ ^(PREPARED|RUNNING)$ ]]; then
+    if [[ "$rc" -eq 0 && "$remote_state" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]]; then
         # A coordinator Pod can be killed after acquiring its durable lock and
         # either before or after publishing RUNNING. The Job's exact journaled
         # identity is the authority for deciding that no coordinator remains.
-        if kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep \
-                && kubectl_job_is_terminal_failure Job "$KUBECTL_RESOURCE_NAME" \
-                    "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_NONCE" \
-                    "$attempt_id" "$KUBECTL_RESOURCE_UID"; then
+        local collect_job_state="" collect_job_rc=0 collect_job_uid=""
+        kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep || rc=1
+        if [[ "$rc" -eq 0 ]]; then
+            kubectl_job_terminal_state collect_job_state "$KUBECTL_RESOURCE_NAME" \
+                "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_NONCE" \
+                "$attempt_id" "$KUBECTL_RESOURCE_UID" || collect_job_rc=$?
+        fi
+        if [[ "$rc" -eq 0 && "$collect_job_rc" -eq 1 ]]; then
+            collect_job_uid=$(kubectl_run_bounded -n "$KUBECTL_RESOURCE_NAMESPACE" \
+                get Job "$KUBECTL_RESOURCE_NAME" --ignore-not-found \
+                -o 'jsonpath={.metadata.uid}') || rc=1
+            [[ "$rc" -ne 0 || -z "$collect_job_uid" ]] || rc=1
+        fi
+        if [[ "$rc" -eq 0 \
+                && ( "$collect_job_state" == FAILED \
+                    || ( "$collect_job_rc" -eq 1 && -z "$collect_job_uid" ) ) ]]; then
             kubectl_recover_lost_coordinator "$KUBECTL_NAMESPACE" "$inspector" \
                 "$attempt_id" || rc=1
             [[ "$rc" -ne 0 ]] || remote_state=$(kubectl_read_remote_status \
@@ -3038,12 +3344,30 @@ kubectl_collect_attempt() {
         fi
     fi
     [[ "$rc" -ne 0 || "$remote_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || rc=1
+    if [[ "$rc" -eq 0 ]]; then
+        local terminal_endpoint_rc=0
+        _kubectl_verify_saved_worker_endpoints "$kubernetes_dir" "$attempt_id" \
+            || terminal_endpoint_rc=$?
+        if [[ "$terminal_endpoint_rc" -eq 2 ]]; then
+            if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" delete-sweep \
+                    && [[ -f "$metadata_dir/endpoint-drift.tsv" \
+                        && ! -L "$metadata_dir/endpoint-drift.tsv" ]]; then
+                : # Status already froze the drift evidence and failed the Job.
+            else
+                echo "Error: worker identity drift prevents safe Kubernetes result collection" >&2
+                rc=1
+            fi
+        elif [[ "$terminal_endpoint_rc" -ne 0 ]]; then
+            rc="$terminal_endpoint_rc"
+        fi
+    fi
     # Durable ledger publication precedes Kubernetes Job status propagation.
     # Collection must wait for this exact Job to be terminal (or for its
     # journaled cancellation deletion to be observably complete) before it
     # imports data or starts foreground cleanup.
     [[ "$rc" -ne 0 ]] || kubectl_wait_journaled_job_quiescent \
-        "$kubernetes_dir" "$attempt_id" || rc=1
+        "$kubernetes_dir" "$attempt_id" \
+        "$KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS_DEFAULT" 1 || rc=1
     if [[ "$rc" -eq 0 ]]; then
         archive_root=$(mktemp -d "${TMPDIR:-/tmp}/storage-scale-test-kubectl-collect.XXXXXX") \
             || rc=1
@@ -3064,8 +3388,9 @@ kubectl_collect_attempt() {
         "$results_dir" "$staging" || rc=1
     state_dir="$staging/$attempt_id/state"
     local verified_terminal=""
-    [[ "$rc" -ne 0 ]] || _kubectl_validate_collected_publication "$state_dir" "$attempt_id" \
-        verified_terminal >/dev/null || rc=1
+    [[ "$rc" -ne 0 ]] || _kubectl_validate_collected_publication "$state_dir" \
+        "$attempt_id" verified_terminal "$metadata_dir/control-bundle/executions" \
+        >/dev/null || rc=1
     [[ "$rc" -ne 0 ]] || [[ "$verified_terminal" == "$remote_state" ]] || rc=1
     [[ "$rc" -ne 0 ]] || _kubectl_merge_collected_results "$state_dir" "$results_dir" || rc=1
     if [[ "$rc" -eq 0 ]]; then

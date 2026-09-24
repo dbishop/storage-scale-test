@@ -202,7 +202,9 @@ connectivity between the coordinator and worker Pods and enforce the
 attempt-scoped network policies; the selected nodes must be able to mount the
 PVC. The configured benchmark image must be usable under the configured pull
 policy, and any registry credentials required by the cluster are a user
-responsibility.
+responsibility. `KUBECTL_IMAGE_PULL_POLICY=Always` requires a digest-qualified
+image reference so the coordinator cannot repull a different build from the
+worker Pods.
 
 `TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
 The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side

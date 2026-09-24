@@ -252,7 +252,7 @@ def test_kubectl_commands_have_request_and_process_timeouts():
     """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == (
-        "--foreground --kill-after=5s 11s kubectl " "--request-timeout=7s get pods"
+        "--kill-after=5s 11s kubectl --request-timeout=7s get pods"
     )
 
 

@@ -255,10 +255,11 @@ creates a new attempt while preserving successful cells.
 
 Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
 not host networking, host ports, or Services. Worker endpoint identity is
-validated before each cell; drift or coordinator loss is recovered only with
-fresh identity evidence. Results are copied from PVC storage to the local
-result tree by collection. A configured namespace, existing PV/PVC, node
-selector, authorized kubectl context, and compatible CNI are prerequisites.
+revalidated by status and collection; the API-independent coordinator probes
+frozen addresses before each cell. Drift or coordinator loss is recovered only
+with fresh identity evidence. Collection copies PVC results to the local result
+tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
+context, and compatible CNI are prerequisites.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 

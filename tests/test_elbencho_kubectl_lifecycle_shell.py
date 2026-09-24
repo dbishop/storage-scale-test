@@ -217,6 +217,208 @@ def test_collection_staging_cannot_escape_results_root(tmp_path: Path) -> None:
     assert not outside.exists()
 
 
+def test_collected_manifest_paths_cannot_escape_staged_state(tmp_path: Path) -> None:
+    """Manifest source paths cannot read adjacent staged or host files."""
+    state = tmp_path / "attempt" / "state"
+    state.mkdir(parents=True)
+    (state / "run.status").write_text("SUCCESS\n", encoding="utf-8")
+    outside = state.parent / "outside"
+    outside.write_text("not collected\n", encoding="utf-8")
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "0001.sh").write_text("export nodes=1\n", encoding="utf-8")
+    digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+    (state / "publication-manifest.tsv").write_text(
+        "schema\t1\n"
+        "attempt_id\t1234abcd\n"
+        f"ledger\t../outside\toutside\t{outside.stat().st_size}\t{digest}\n",
+        encoding="utf-8",
+    )
+    result = _bash(
+        f"! _kubectl_validate_collected_publication {str(state)!r} "
+        f"1234abcd terminal {str(definitions)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_collected_manifest_rejects_duplicate_semantic_rows(tmp_path: Path) -> None:
+    """A publication cannot redefine identity, executions, or destinations."""
+    state = tmp_path / "state"
+    state.mkdir()
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "0001.sh").write_text("export nodes=1\n", encoding="utf-8")
+    (state / "run.status").write_text("SUCCESS\n", encoding="utf-8")
+    manifest = state / "publication-manifest.tsv"
+    for duplicate in (
+        "schema\t1",
+        "attempt_id\t1234abcd",
+        "execution\t0001\tSUCCESS",
+    ):
+        manifest.write_text(
+            "schema\t1\n"
+            "attempt_id\t1234abcd\n"
+            "execution\t0001\tSUCCESS\n"
+            f"{duplicate}\n",
+            encoding="utf-8",
+        )
+        result = _bash(
+            f"! _kubectl_validate_collected_publication {str(state)!r} "
+            f"1234abcd terminal {str(definitions)!r}"
+        )
+        assert result.returncode == 0, result.stderr
+
+
+def test_collected_manifest_requires_complete_terminal_evidence(tmp_path: Path) -> None:
+    """Collection cannot delete remote state after accepting an omission."""
+    state = tmp_path / "state"
+    (state / "executions").mkdir(parents=True)
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "0001.sh").write_text("export nodes=1\n", encoding="utf-8")
+    (state / "run.status").write_text("SUCCESS\n", encoding="utf-8")
+    (state / "publication-manifest.tsv").write_text(
+        "schema\t1\nattempt_id\t1234abcd\n", encoding="utf-8"
+    )
+    result = _bash(
+        f"! _kubectl_validate_collected_publication {str(state)!r} "
+        f"1234abcd terminal {str(definitions)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_fresh_collection_uses_immutable_local_execution_definitions() -> None:
+    """PVC content cannot redefine the execution set used by validation."""
+    source = _FUNCTIONS.read_text(encoding="utf-8")
+    body = source.split("kubectl_collect_attempt() {", 1)[1].split(
+        "\n}\n\nkubectl_resume_collected_sweep", 1
+    )[0]
+    assert '"$metadata_dir/control-bundle/executions"' in body
+    assert '"$staging/$attempt_id/control/executions"' not in body
+
+
+def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) -> None:
+    """A complete cell ledger and required workload output are collectible."""
+    state = tmp_path / "state"
+    executions = state / "executions"
+    result_dir = state / "results/0001/executions"
+    executions.mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "0001.sh").write_text(
+        "export nodes=1\n"
+        "export ELBENCHO_FILE_LAYOUT=shared-directory\n"
+        "export ELBENCHO_FILES_PER_NODE=1\n",
+        encoding="utf-8",
+    )
+    files = {
+        "run.status": "SUCCESS\n",
+        "run-summary.tsv": "run_status\tSUCCESS\n",
+        "env_used.sh": "export TEST=1\n",
+        "env_used.yaml": "TEST: 1\n",
+        "executions/0001.status": "SUCCESS\n",
+        "executions/0001.exitcode": "0\n",
+        "executions/0001.workers.tsv": "node-a\tpod-a\tuid-a\t10.0.0.1\n",
+        "results/0001/executions/0001.workload.tsv": "schema\t1\n",
+    }
+    for relative, contents in files.items():
+        path = state / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    roles = {
+        "run.status": "ledger",
+        "run-summary.tsv": "ledger",
+        "env_used.sh": "snapshot",
+        "env_used.yaml": "snapshot",
+        "executions/0001.status": "ledger",
+        "executions/0001.exitcode": "ledger",
+        "executions/0001.workers.tsv": "ledger",
+        "results/0001/executions/0001.workload.tsv": "result",
+    }
+    destinations = {
+        "results/0001/executions/0001.workload.tsv": "executions/0001.workload.tsv"
+    }
+    rows = ["schema\t1", "attempt_id\t1234abcd", "execution\t0001\tSUCCESS"]
+    for relative, role in roles.items():
+        path = state / relative
+        rows.append(
+            f"{role}\t{relative}\t{destinations.get(relative, relative)}\t"
+            f"{path.stat().st_size}\t{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        )
+    (state / "publication-manifest.tsv").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+    result = _bash(
+        f"_kubectl_validate_collected_publication {str(state)!r} "
+        f"1234abcd terminal {str(definitions)!r} >/dev/null; [[ $terminal == SUCCESS ]]"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_collected_manifest_rejects_cross_execution_workload_substitution(
+    tmp_path: Path,
+) -> None:
+    """One cell's artifact cannot satisfy another cell's completion contract."""
+    state = tmp_path / "state"
+    executions = state / "executions"
+    result_dir = state / "results/0002/executions"
+    executions.mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "0001.sh").write_text(
+        "export ELBENCHO_FILE_LAYOUT=shared-directory\n"
+        "export ELBENCHO_FILES_PER_NODE=1\n",
+        encoding="utf-8",
+    )
+    files = {
+        "run.status": "SUCCESS\n",
+        "run-summary.tsv": "run_status\tSUCCESS\n",
+        "env_used.sh": "export TEST=1\n",
+        "env_used.yaml": "TEST: 1\n",
+        "executions/0001.status": "SUCCESS\n",
+        "executions/0001.exitcode": "0\n",
+        "executions/0001.workers.tsv": "node-a\tpod-a\tuid-a\t10.0.0.1\n",
+        "results/0002/executions/0002.workload.tsv": "schema\t1\n",
+    }
+    rows = ["schema\t1", "attempt_id\t1234abcd", "execution\t0001\tSUCCESS"]
+    for relative, contents in files.items():
+        path = state / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+        role = "snapshot" if relative.startswith("env_used.") else "ledger"
+        destination = relative
+        if relative.startswith("results/"):
+            role = "result"
+            destination = "executions/0001.workload.tsv"
+        rows.append(
+            f"{role}\t{relative}\t{destination}\t{path.stat().st_size}\t"
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        )
+    (state / "publication-manifest.tsv").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+    result = _bash(
+        f"! _kubectl_validate_collected_publication {str(state)!r} "
+        f"1234abcd terminal {str(definitions)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_legacy_execution_does_not_require_workload_metadata(tmp_path: Path) -> None:
+    """The collector follows the existing legacy completion contract."""
+    definition = tmp_path / "0001.sh"
+    definition.write_text(
+        "export ELBENCHO_FILE_LAYOUT=worker-directories\n",
+        encoding="utf-8",
+    )
+    result = _bash(
+        f"! _kubectl_execution_requires_workload_metadata {str(definition)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -> None:
     """Collection publishes exit-code and worker evidence beside cell status."""
     state = tmp_path / "state"
@@ -248,6 +450,60 @@ def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -
     assert "node-a" in (results / "executions/0001.workers.tsv").read_text(
         encoding="utf-8"
     )
+
+
+def test_collection_never_follows_result_parent_symlinks(tmp_path: Path) -> None:
+    """Manifest destinations cannot redirect publication outside results."""
+    state = tmp_path / "state"
+    source = state / "results/0001/output.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("collected\n", encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    (state / "publication-manifest.tsv").write_text(
+        f"result\tresults/0001/output.txt\tlinked/output.txt\t"
+        f"{source.stat().st_size}\t{digest}\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "results"
+    outside = tmp_path / "outside"
+    results.mkdir()
+    outside.mkdir()
+    (results / "linked").symlink_to(outside, target_is_directory=True)
+    result = _bash(
+        f"! _kubectl_merge_collected_results {str(state)!r} {str(results)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (outside / "output.txt").exists()
+
+
+def test_resume_cleanup_never_follows_result_parent_symlinks(tmp_path: Path) -> None:
+    """Superseded-artifact cleanup cannot unlink through a redirected parent."""
+    results = tmp_path / "results"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "output.txt"
+    victim.write_text("prior\n", encoding="utf-8")
+    results.mkdir()
+    (results / "linked").symlink_to(outside, target_is_directory=True)
+    prior = results / "kubernetes/attempts/11111111/collected-state"
+    prior.mkdir(parents=True)
+    digest = hashlib.sha256(victim.read_bytes()).hexdigest()
+    (prior / "publication-manifest.tsv").write_text(
+        f"result\tresults/0001/output.txt\tlinked/output.txt\t"
+        f"{victim.stat().st_size}\t{digest}\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "publication-manifest.tsv").write_text(
+        "execution\t0001\tSUCCESS\n", encoding="utf-8"
+    )
+    result = _bash(
+        f"! _kubectl_remove_superseded_collection_paths {str(state)!r} "
+        f"{str(results)!r}"
+    )
+    assert result.returncode == 0, result.stderr
+    assert victim.read_text(encoding="utf-8") == "prior\n"
 
 
 def test_resume_replaces_only_digest_verified_non_success_artifacts(
@@ -379,6 +635,14 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
 
 
+def test_bounded_kubectl_owns_the_child_process_group() -> None:
+    """A wedged exec cannot evade timeout through foreground mode."""
+    source = _FUNCTIONS.read_text(encoding="utf-8")
+    body = source.split("kubectl_run_bounded() {", 1)[1].split("\n}", 1)[0]
+    assert "timeout --kill-after=5s" in body
+    assert "timeout --foreground" not in body
+
+
 def test_collection_waits_for_exact_journaled_job_quiescence(
     tmp_path: Path,
 ) -> None:
@@ -393,6 +657,7 @@ def test_collection_waits_for_exact_journaled_job_quiescence(
           KUBECTL_RESOURCE_UID=job-uid
         }}
         kubectl_attempt_step_done() {{ return 1; }}
+        kubectl_run_bounded() {{ printf '%s' job-uid; }}
         kubectl_job_terminal_state() {{
           printf x >> "$calls"
           if [[ $(wc -c < "$calls") -eq 1 ]]; then
@@ -634,6 +899,20 @@ def test_runtime_configuration_rejects_every_invalid_field() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
+    """A coordinator repull cannot diverge from the frozen worker image."""
+    result = _bash("""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Always KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        ! kubectl_validate_runtime_configuration
+        export KUBECTL_ELBENCHO_IMAGE='breuner/elbencho:v3.1-11@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        kubectl_validate_runtime_configuration
+        """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_pvc_path_validator_defends_reserved_tree_and_future_parent() -> None:
     """PVC workload paths cannot include or contain orchestration state."""
     result = _bash("""
@@ -676,7 +955,11 @@ def test_runtime_preflight_covers_complete_coordinator_command_contract() -> Non
     source = _FUNCTIONS.read_text(encoding="utf-8")
     body = source.split("kubectl_validate_runtime_pod() {", 1)[1].split(
         "\n}\n\nkubectl_discover_candidate_nodes", 1
-    )[0]
+    )[0] + (
+        _ROOT / "storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl"
+    ).read_text(
+        encoding="utf-8"
+    )
     for command in (
         "elbencho",
         "bash",
@@ -710,6 +993,26 @@ def test_runtime_preflight_covers_complete_coordinator_command_contract() -> Non
         "od",
     ):
         assert command in body, command
+
+
+def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
+    """Interrupted validation cannot leave an unbounded sleeping helper."""
+    result = _bash("""
+        kubectl_render_attempt_template storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl \
+          NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-validation ATTEMPT_ID=1234abcd \
+          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.1-11 \
+          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \
+          NODE_NAME=node-a
+        """)
+    assert result.returncode == 0, result.stderr
+    job = yaml.safe_load(result.stdout)
+    assert job["kind"] == "Job"
+    assert job["spec"]["activeDeadlineSeconds"] == 180
+    assert job["spec"]["ttlSecondsAfterFinished"] == 60
+    pod = job["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["restartPolicy"] == "Never"
+    body = pod["containers"][0]["args"][0]
     assert "type -P stat" in body
     assert "type -P gstat" in body
     assert "type -P pkill" in body
@@ -884,6 +1187,17 @@ def test_remote_release_executes_guards_before_owner_read_and_deletion(
         }}
         kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
         [[ ! -e "$lock" && ! -e "$run" ]]
+
+        pending="$lock.pending.1234abcd.$nonce"
+        mkdir "$pending"
+        kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
+        [[ ! -e "$pending" ]]
+
+        mkdir "$pending"
+        printf 'unexpected\n' > "$pending/not-owned"
+        ! kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
+        [[ -f "$pending/not-owned" ]]
+        rm -rf -- "$pending"
 
         mkdir -p "$lock" "$run" "$mount/outside"
         ln -s "$mount/outside/owner" "$lock/owner"
@@ -1241,6 +1555,110 @@ def test_creation_intent_cleans_object_left_before_resource_journal(
         kubectl_local_lock_release "$fd"
         """
     )
+    assert result.returncode == 0, result.stderr
+
+
+def test_creation_intent_rechecks_absence_after_create_deadline(tmp_path: Path) -> None:
+    """A delayed accepted create remains discoverable before intent removal."""
+    calls = tmp_path / "calls"
+    events = tmp_path / "events"
+    result = _bash(_identity(tmp_path / "state") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd transfer \
+          Pod helper test-ns 0123456789abcdef0123456789abcdef
+        calls={str(calls)!r}
+        events={str(events)!r}
+        kubectl_run_bounded() {{
+            printf x >> "$calls"
+            [[ $(wc -c < "$calls") -eq 1 ]] || printf uid-delayed
+        }}
+        sleep() {{ :; }}
+        kubectl_verify_object_identity() {{ [[ "$6" == uid-delayed ]]; }}
+        kubectl_delete_owned_object() {{ printf delete > "$events"; }}
+        kubectl_cleanup_creation_intent "$root" "$fd" 1234abcd transfer
+        [[ $(cat "$calls") == xx && $(cat "$events") == delete ]]
+        [[ ! -e "$root/attempts/1234abcd/creation-intents/transfer.sh" ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ephemeral_cleanup_reconciles_intent_only_helpers(tmp_path: Path) -> None:
+    """Status retries remove a helper killed between API create and UID journal."""
+    result = _bash(
+        _identity(tmp_path / "state")
+        + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd status-deadbeef \
+          Pod status-helper test-ns 0123456789abcdef0123456789abcdef
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd transfer \
+          Pod transfer-helper test-ns 0123456789abcdef0123456789abcdef
+        events="""
+        + str(tmp_path / "events")
+        + """
+        kubectl_run_bounded() { printf uid-1; }
+        kubectl_verify_object_identity() { :; }
+        kubectl_delete_owned_object() { printf delete >> "$events"; }
+        kubectl_cleanup_ephemeral_helpers "$root" "$fd" 1234abcd
+        [[ $(cat "$events") == delete ]]
+        [[ ! -e "$root/attempts/1234abcd/creation-intents/status-deadbeef.sh" ]]
+        [[ -f "$root/attempts/1234abcd/creation-intents/transfer.sh" ]]
+        kubectl_local_lock_release "$fd"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_cleanup_step_journal_is_safe_and_idempotent(tmp_path: Path) -> None:
+    """Lifecycle retries accept committed steps but reject unsafe markers."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        marker="$root/attempts/1234abcd/cleanup/delete-sweep"
+        rm -f -- "$marker"
+        ln -s /dev/null "$marker"
+        ! kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        rm -f -- "$marker"
+        mkdir "$marker"
+        ! kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_remote_lock_is_published_only_after_ownership() -> None:
+    """The canonical PVC lock never exists without its recovery identity."""
+    source = _FUNCTIONS.read_text(encoding="utf-8")
+    body = source.split("kubectl_reserve_remote_attempt() {", 1)[1].split(
+        "\n}\n\nkubectl_attempt_journal_remote_reservation", 1
+    )[0]
+    assert 'printf "%s\\\\t%s\\\\n" "$attempt" "$nonce" > "$pending/owner"' in body
+    assert body.index('> "$pending/owner"') < body.index(
+        'mv -T -n -- "$pending" "$lock"'
+    )
+
+
+def test_cancel_retries_after_job_delete_was_already_journaled(
+    tmp_path: Path,
+) -> None:
+    """A crash after delete-sweep publication cannot strand cancellation."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd CANCEL_REQUESTED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        kubectl_read_remote_status() { printf RUNNING; }
+        kubectl_delete_owned_object() { :; }
+        kubectl_finalize_cancelled_attempt() { :; }
+        [[ $(kubectl_cancel_journaled_attempt "$root" "$fd" test-ns helper \
+          1234abcd 0123456789abcdef0123456789abcdef) == CANCELLED ]]
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == TERMINAL ]]
+        kubectl_local_lock_release "$fd"
+        """)
     assert result.returncode == 0, result.stderr
 
 

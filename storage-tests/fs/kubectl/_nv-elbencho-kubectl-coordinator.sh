@@ -242,12 +242,14 @@ _coordinator_initialize_state() {
         _coordinator_error "unable to acquire coordinator lock"
         return 1
     fi
+    local owner_tmp="$STATE_DIR/coordinator.lock/.owner.tmp.${BASHPID:-$$}.${RANDOM}"
     {
         printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
         printf 'pid\t%s\n' "${BASHPID:-$$}"
         printf 'started_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } > "$STATE_DIR/coordinator.lock/owner.tsv" || return 1
+    } > "$owner_tmp" \
+        && mv -- "$owner_tmp" "$STATE_DIR/coordinator.lock/owner.tsv" || return 1
     _coordinator_integration_crash_after after-lock
     _coordinator_initialize_snapshots || return 1
     _coordinator_integration_crash_after after-snapshots
@@ -315,7 +317,7 @@ _coordinator_probe_endpoint_request() {
     printf 'GET /status HTTP/1.0\r\nHost: %s:1611\r\n\r\n' "$endpoint" >&3
     IFS= read -r response <&3
     exec 3>&-
-    [[ "$response" == *" 200 "* ]]
+    [[ "$response" =~ ^HTTP/[0-9.]+[[:space:]]200([[:space:]]|$) ]]
 }
 
 _coordinator_health_hook() {
@@ -522,20 +524,19 @@ _coordinator_require_success_artifacts() {
     # shared-directory and staged-read modes. Legacy worker-directory output is
     # parsed from Elbencho's regular .out/.csv artifacts and has no synthetic
     # completion sidecar to require here.
-    local required=("$scratch/executions/$id.workload.tsv")
+    local required=()
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
             && "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
-        :
+        required+=("$scratch/executions/$id.workload.tsv")
     elif [[ "${ELBENCHO_FILE_LAYOUT:-worker-directories}" == shared-directory \
             && -n "${ELBENCHO_FILES_PER_NODE:-}" ]]; then
-        required+=("$scratch/executions/$id.write.json")
+        required+=("$scratch/executions/$id.workload.tsv" \
+            "$scratch/executions/$id.write.json")
         [[ "${ELBENCHO_SWEEP_WRITE_ONLY:-0}" == 1 \
             || "${ELBENCHO_SWEEP_WRITE_NO_READ:-0}" == 1 ]] \
             || required+=("$scratch/executions/$id.read.json")
         [[ "${ELBENCHO_SWEEP_WRITE_ONLY:-0}" == 1 ]] \
             || required+=("$scratch/executions/$id.delete.json")
-    else
-        return 0
     fi
     local artifact
     for artifact in "${required[@]}"; do
@@ -561,8 +562,8 @@ _coordinator_finish_startup_failure() {
     local message="$1" rc="${2:-1}"
     _coordinator_error "$message"
     _coordinator_atomic_write "$STATE_DIR/startup-error.txt" "$message" || return 1
-    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || return 1
     _coordinator_write_summary FAILED '' "$rc" || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || return 1
     _coordinator_publish_manifest
 }
 
@@ -578,8 +579,8 @@ _coordinator_signal_handler() {
         _coordinator_finish_prebenchmark_failure "$COORDINATOR_ACTIVE_ID" \
             "${COORDINATOR_ACTIVE_SCRATCH:-$SCRATCH_DIR}" "$rc" || true
     fi
-    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || true
     _coordinator_write_summary FAILED "${COORDINATOR_ACTIVE_ID:-}" "$rc" || true
+    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || true
     _coordinator_publish_manifest || true
     exit "$rc"
 }
@@ -799,9 +800,71 @@ _coordinator_finalize_run() {
     local rc="$1" failed_id="${2:-}"
     local final=SUCCESS
     [[ "$rc" -eq 0 ]] || final=FAILED
-    _coordinator_atomic_write "$STATE_DIR/run.status" "$final" || return 1
     _coordinator_write_summary "$final" "$failed_id" "$rc" || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" "$final" || return 1
     _coordinator_publish_manifest
+}
+
+_coordinator_repair_terminal_publication() {
+    local terminal="$1" status_file id status failed_id="" exit_code=0
+    local pending=0 failed=0
+    [[ "$terminal" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || return 1
+    for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
+        [[ -f "$status_file" && ! -L "$status_file" ]] || continue
+        id=$(basename "$status_file" .status)
+        status=$(cat "$status_file") || return 1
+        case "$status" in
+            SUCCESS) ;;
+            PENDING) pending=$((pending + 1)) ;;
+            FAILED)
+                failed=$((failed + 1))
+                if [[ -z "$failed_id" ]]; then
+                    failed_id="$id"
+                    exit_code=$(cat "$STATE_DIR/executions/$id.exitcode" 2>/dev/null || true)
+                    [[ "$exit_code" =~ ^[1-9][0-9]*$ ]] || return 1
+                fi
+                ;;
+            RUNNING|*) return 1 ;;
+        esac
+    done
+    case "$terminal" in
+        SUCCESS) [[ "$pending" -eq 0 && "$failed" -eq 0 ]] || return 1 ;;
+        FAILED)
+            if [[ "$failed" -eq 0 ]]; then
+                [[ -f "$STATE_DIR/startup-error.txt" \
+                    && ! -L "$STATE_DIR/startup-error.txt" ]] || return 1
+                exit_code=1
+            fi
+            ;;
+        CANCELLED) exit_code=143 ;;
+    esac
+    _coordinator_write_summary "$terminal" "$failed_id" "$exit_code" || return 1
+    _coordinator_publish_manifest
+}
+
+_coordinator_ensure_recovery_lock() {
+    local observed_run_status="$1" lock="$STATE_DIR/coordinator.lock"
+    if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+        [[ "$observed_run_status" == PREPARED ]] || return 1
+        mkdir "$lock" || return 1
+    fi
+    [[ -d "$lock" && ! -L "$lock" ]] || return 1
+    local owner="$lock/owner.tsv"
+    if [[ ! -e "$owner" && ! -L "$owner" ]]; then
+        [[ "$observed_run_status" == PREPARED ]] || return 1
+        local tmp="$lock/.owner.recovery.tmp.${BASHPID:-$$}.${RANDOM}"
+        {
+            printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
+            printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
+            printf 'recovered\ttrue\n'
+            printf 'started_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "$tmp" && mv -- "$tmp" "$owner" || return 1
+    fi
+    [[ -f "$owner" && ! -L "$owner" \
+        && $(awk -F '\t' '$1 == "schema" {print $2}' "$owner") \
+            == "$KUBECTL_COORDINATOR_SCHEMA" \
+        && $(awk -F '\t' '$1 == "attempt_id" {print $2}' "$owner") \
+            == "$ATTEMPT_ID" ]]
 }
 
 _coordinator_recover_lost() {
@@ -814,17 +877,21 @@ _coordinator_recover_lost() {
     source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
-    [[ -d "$STATE_DIR/coordinator.lock" && ! -L "$STATE_DIR/coordinator.lock" ]] || {
-        _coordinator_error "lost-coordinator recovery requires the durable coordinator lock"
-        return 1
-    }
     _coordinator_validate_state_tree || return 1
     local observed_run_status
     observed_run_status=$(cat "$STATE_DIR/run.status" 2>/dev/null || true)
-    [[ "$observed_run_status" =~ ^(PREPARED|RUNNING)$ ]] || {
-        _coordinator_error "lost-coordinator recovery requires a PREPARED or RUNNING attempt"
+    [[ "$observed_run_status" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] || {
+        _coordinator_error "lost-coordinator recovery found an invalid attempt state"
         return 1
     }
+    _coordinator_ensure_recovery_lock "$observed_run_status" || {
+        _coordinator_error "lost-coordinator recovery found an invalid durable lock"
+        return 1
+    }
+    if [[ "$observed_run_status" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]]; then
+        _coordinator_repair_terminal_publication "$observed_run_status"
+        return
+    fi
     local allow_startup_repair=0
     [[ "$observed_run_status" == PREPARED ]] && allow_startup_repair=1
     _coordinator_initialize_snapshots "$allow_startup_repair" || return 1
@@ -895,8 +962,8 @@ _coordinator_recover_lost() {
         printf 'exit_code\t%s\n' "$recovery_exit_code"
     } > "$recovery_tmp" \
         && mv -f -- "$recovery_tmp" "$STATE_DIR/coordinator-loss.tsv" || return 1
-    _coordinator_atomic_write "$STATE_DIR/run.status" "$recovery_terminal" || return 1
     _coordinator_write_summary "$recovery_terminal" "$failed_id" "$recovery_exit_code" || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" "$recovery_terminal" || return 1
     _coordinator_publish_manifest
 }
 
@@ -910,8 +977,11 @@ _coordinator_finalize_cancelled() {
     source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
-    [[ -d "$STATE_DIR/coordinator.lock" && ! -L "$STATE_DIR/coordinator.lock" ]] \
-        || return 1
+    _coordinator_validate_state_tree || return 1
+    local observed_run_status
+    observed_run_status=$(cat "$STATE_DIR/run.status" 2>/dev/null || true)
+    [[ "$observed_run_status" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] \
+        && _coordinator_ensure_recovery_lock "$observed_run_status" || return 1
     local status_file id status failed_id=""
     for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
         [[ -f "$status_file" && ! -L "$status_file" ]] || continue
@@ -928,8 +998,8 @@ _coordinator_finalize_cancelled() {
             *) return 1 ;;
         esac
     done
-    _coordinator_atomic_write "$STATE_DIR/run.status" CANCELLED || return 1
     _coordinator_write_summary CANCELLED "$failed_id" 143 || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" CANCELLED || return 1
     _coordinator_publish_manifest
 }
 

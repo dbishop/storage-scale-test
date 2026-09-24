@@ -417,6 +417,18 @@ def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
     ).read_text(encoding="utf-8")
 
 
+def test_job_loss_before_coordinator_lock_is_recoverable(tmp_path):
+    """A Job that never started cannot strand a PREPARED PVC attempt."""
+    control, state_dir, scratch, _ = _write_bundle(tmp_path, execution_count=1)
+    state_dir.mkdir()
+    (state_dir / "run.status").write_text("PREPARED\n", encoding="utf-8")
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    owner = (state_dir / "coordinator.lock/owner.tsv").read_text(encoding="utf-8")
+    assert "attempt_id\t1234abcd" in owner
+
+
 def test_lost_coordinator_recovery_publishes_all_terminal_success(tmp_path):
     """A crash after the final cell is terminal still becomes collectable."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
@@ -437,6 +449,26 @@ def test_lost_coordinator_recovery_publishes_all_terminal_success(tmp_path):
     assert "recovered_status\tSUCCESS" in (
         state_dir / "coordinator-loss.tsv"
     ).read_text(encoding="utf-8")
+
+
+def test_lost_coordinator_repairs_terminal_status_manifest_window(tmp_path):
+    """A crash after terminal run status can republish complete evidence."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    (state_dir / "run.status").write_text("SUCCESS\n", encoding="utf-8")
+    (state_dir / "publication-manifest.tsv").unlink(missing_ok=True)
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    manifest = (state_dir / "publication-manifest.tsv").read_text(encoding="utf-8")
+    assert "execution\t0001\tSUCCESS" in manifest
+    assert "ledger\trun.status\trun.status" in manifest
 
 
 def test_lost_coordinator_recovery_preserves_all_terminal_failure(tmp_path):
@@ -715,6 +747,27 @@ def test_missing_required_shared_workload_artifact_converts_success_to_failure(
         encoding="utf-8"
     ).strip() == "FAILED"
     assert "lacks required artifact 0001.write.json" in result.stderr
+
+
+def test_legacy_worker_directory_success_does_not_require_workload_metadata(tmp_path):
+    """Legacy output remains complete without shared-layout TSV sidecars."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    fake_lines = fake.read_text(encoding="utf-8").splitlines()
+    fake.write_text(
+        "\n".join(
+            line
+            for line in fake_lines
+            if "workload-%s" not in line and "workload.tsv" not in line
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    assert (state_dir / "executions" / "0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "SUCCESS"
+    assert not (state_dir / "results/0001/executions/0001.workload.tsv").exists()
 
 
 def test_same_attempt_never_resets_running_or_retries_failed_cells(tmp_path):
