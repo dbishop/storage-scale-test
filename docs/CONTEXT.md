@@ -101,6 +101,9 @@ headroom; SBX is a supported local backend.
 
 The kubectl filesystem-sweep design and acceptance boundary are documented in
 [plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
+Its normative state machines, invariants, fault matrix, and unsupported cases
+are frozen in
+[KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
 Attempts publish their local current pointer only after acquiring durable PVC
 ownership and freezing worker evidence; resume uses compare-and-swap against
 the collected predecessor. Collection waits for the exact journaled Job to

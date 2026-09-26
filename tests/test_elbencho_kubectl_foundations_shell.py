@@ -383,8 +383,46 @@ def test_resource_diagnostics_are_bounded_and_best_effort(tmp_path):
         [[ -f "$path/resource.yaml" && -f "$path/resource.describe" ]]
         [[ -f "$path/pods.yaml" && -f "$path/pods.log" ]]
         [[ -f "$path/events.txt" ]]
+        grep -F $'schema\t1' "$path/bundle.tsv"
+        grep -F $'attempt_id\t1234abcd' "$path/bundle.tsv"
+        grep -F $'resource_kind\tDaemonSet' "$path/bundle.tsv"
         grep -F -- '--field-selector involvedObject.name=worker-a' "$calls"
         ! grep -F -- 'get events --sort-by' "$calls"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_diagnostic_capture_failure_prints_manual_inspection(tmp_path):
+    """Supplemental failure retains the primary path and a safe operator command."""
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    result = _run_bash(f"""
+        KUBECTL_NAMESPACE=test-ns
+        kubectl_capture_attempt_diagnostics() {{ return 1; }}
+        kubectl_preserve_attempt_diagnostics {str(attempt)!r} 1234abcd collect-failed
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "automatic Kubernetes diagnostic capture failed" in result.stderr
+    assert "kubectl -n test-ns get job" in result.stderr
+    assert "last proven local and PVC state was retained" in result.stderr
+
+
+def test_readiness_diagnosis_bounds_event_queries(tmp_path):
+    """A large failed Pod set cannot turn diagnosis into another long outage."""
+    calls = tmp_path / "calls"
+    result = _run_bash(f"""
+        calls={str(calls)!r}
+        kubectl_run_observational() {{
+            printf '%s\n' "$*" >> "$calls"
+            if [[ "$*" == *'-o name'* ]]; then
+                for i in $(seq 1 20); do printf 'pod/worker-%s\n' "$i"; done
+            elif [[ "$*" == *'get events'* ]]; then
+                printf 'FailedScheduling\tno capacity\n'
+            fi
+        }}
+        kubectl_classify_readiness_failure reason test-ns 1234abcd
+        [[ "$reason" == POD_UNSCHEDULABLE ]]
+        [[ $(grep -c 'get events' "$calls") -eq 4 ]]
     """)
     assert result.returncode == 0, result.stderr
 
