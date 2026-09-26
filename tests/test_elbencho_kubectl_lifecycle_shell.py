@@ -635,6 +635,72 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
 
 
+def test_collection_byte_limit_is_enforced_while_streaming(tmp_path: Path) -> None:
+    """The receiver stops an oversized stream before it fills local storage."""
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        printf 12345678 | _kubectl_write_bounded_collection_stream \
+            {str(archive)!r} 8
+        test "$(cat {str(archive)!r})" = 12345678
+        rm -- {str(archive)!r}
+
+        ! printf 123456789 | _kubectl_write_bounded_collection_stream \
+            {str(archive)!r} 8
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "exceeded its byte limit while streaming" in result.stderr
+
+
+def test_collection_capacity_checks_the_results_filesystem(tmp_path: Path) -> None:
+    """Collection fails before transfer when its local working set will not fit."""
+    result = _bash(f"""
+        calls={str(tmp_path / 'df-calls')!r}
+        df() {{
+            printf x >> "$calls"
+            printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
+            if [[ "$capacity_mode" == low ]]; then
+                printf 'fixture 1000 999 1 99%% /fixture\\n'
+            else
+                printf 'fixture 100000 1 99999 1%% /fixture\\n'
+            fi
+        }}
+        capacity_mode=low
+        ! _kubectl_require_collection_capacity {str(tmp_path)!r} 1024
+        capacity_mode=enough
+        _kubectl_require_collection_capacity {str(tmp_path)!r} 1024
+        test "$(cat "$calls")" = xx
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "insufficient local free space" in result.stderr
+    assert f"available below {tmp_path}" in result.stderr
+
+
+def test_collection_scavenges_only_owned_staging_paths(tmp_path: Path) -> None:
+    """A retry removes stale working trees without following hostile links."""
+    stale = tmp_path / ".kubernetes-collect-1234abcd.A1"
+    stale_work = tmp_path / ".kubernetes-collect-work-1234abcd.B2"
+    unrelated = tmp_path / ".kubernetes-collect-not-ours"
+    outside = tmp_path / "outside"
+    stale.mkdir()
+    stale_work.mkdir()
+    unrelated.mkdir()
+    outside.mkdir()
+    result = _bash(f"""
+        _kubectl_scavenge_collection_staging {str(tmp_path)!r}
+        test ! -e {str(stale)!r}
+        test ! -e {str(stale_work)!r}
+        test -d {str(unrelated)!r}
+
+        ln -s {str(outside)!r} {str(stale)!r}
+        ! _kubectl_scavenge_collection_staging {str(tmp_path)!r}
+        test -L {str(stale)!r}
+        test -d {str(outside)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "unsafe stale Kubernetes collection staging path" in result.stderr
+
+
 def test_bounded_kubectl_owns_the_child_process_group() -> None:
     """A wedged exec cannot evade timeout through foreground mode."""
     source = _FUNCTIONS.read_text(encoding="utf-8")
@@ -1183,7 +1249,8 @@ def test_remote_release_executes_guards_before_owner_read_and_deletion(
             script=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$script")
             lock_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$7")
             run_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$8")
-            bash -ceu "$script" bash "$lock_arg" "$run_arg" "$9" "${{10}}"
+            bash -ceu "$script" bash "$lock_arg" "$run_arg" "$9" "${{10}}" \
+                "${{11}}"
         }}
         kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
         [[ ! -e "$lock" && ! -e "$run" ]]
@@ -1204,6 +1271,40 @@ def test_remote_release_executes_guards_before_owner_read_and_deletion(
         ! kubectl_release_remote_attempt test-ns helper 1234abcd "$nonce"
         [[ -L "$lock/owner" && -d "$run" ]]
         """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_intended_reservation_does_not_touch_competing_pvc_owner(
+    tmp_path: Path,
+) -> None:
+    """A losing reservation rolls back without waiting for or deleting its winner."""
+    mount = tmp_path / "mount"
+    result = _bash(_identity(tmp_path / "state") + f"""
+        mount={str(mount)!r}
+        storage_root="$mount/.storage-scale-test"
+        canonical="$storage_root/locks/kubernetes-elbencho-sweep"
+        losing_run="$storage_root/runs/1234abcd"
+        mkdir -p "$canonical" "$storage_root/runs"
+        printf 'deadbeef\t11111111111111111111111111111111\n' > "$canonical/owner"
+        kubectl_attempt_journal_remote_reservation "$root" "$fd" 1234abcd \
+          0123456789abcdef0123456789abcdef
+        kubectl_pvc_exec() {{
+            script="$5"
+            script=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$script")
+            lock_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$7")
+            run_arg=$(sed "s#/mnt/storage-scale-test#$mount#g" <<< "$8")
+            bash -ceu "$script" bash "$lock_arg" "$run_arg" "$9" "${{10}}" \
+                "${{11}}"
+        }}
+        kubectl_release_journaled_remote_attempt "$root" "$fd" test-ns helper \
+            1234abcd
+        [[ $(cat "$canonical/owner") == \
+            $'deadbeef\t11111111111111111111111111111111' ]]
+        [[ ! -e "$losing_run" ]]
+        kubectl_attempt_step_done "$root" 1234abcd release-remote-run
+        kubectl_attempt_step_done "$root" 1234abcd release-remote-lock
+        kubectl_local_lock_release "$fd"
+    """)
     assert result.returncode == 0, result.stderr
 
 
@@ -1409,6 +1510,107 @@ def test_submission_rollback_failure_keeps_prepared_attempt_recoverable(
     assert result.returncode == 0, result.stderr
 
 
+def test_interrupted_bundle_upload_never_starts_job_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    """A partial control transfer is removed before any coordinator can run."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        : > "$root/attempts/1234abcd/configuration.sh"
+        : > "$root/attempts/1234abcd/remote-reservation.sh"
+        kubectl_local_lock_release "$fd"
+        events={str(tmp_path / 'events')!r}
+        kubectl_validate_runtime_configuration() {{ :; }}
+        kubectl_map_test_dirs() {{ :; }}
+        kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
+        kubectl_prepare_control_bundle() {{ printf -v "$1" {str(bundle)!r}; }}
+        kubectl_populate_sweep_control_bundle() {{ :; }}
+        kubectl_attempt_load_resource() {{
+            KUBECTL_RESOURCE_KIND=Pod
+            KUBECTL_RESOURCE_NAME=transfer
+            KUBECTL_RESOURCE_NAMESPACE=test-ns
+            KUBECTL_RESOURCE_NONCE=0123456789abcdef0123456789abcdef
+            KUBECTL_RESOURCE_UID=transfer-uid
+        }}
+        kubectl_upload_control_bundle() {{ printf upload- >> "$events"; return 1; }}
+        kubectl_create_owned_object() {{ printf job- >> "$events"; return 1; }}
+        kubectl_quiesce_prepared_workloads() {{ printf quiesce- >> "$events"; }}
+        kubectl_preserve_attempt_diagnostics() {{ printf diagnostics- >> "$events"; }}
+        _kubectl_create_inspector() {{
+            printf -v "$1" helper
+            printf -v "$2" helper-uid
+        }}
+        kubectl_release_journaled_remote_attempt() {{ printf release- >> "$events"; }}
+        _kubectl_remove_inspector() {{ :; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup- >> "$events"; }}
+        ! kubectl_submit_sweep {str(results)!r} 1
+        [[ $(cat "$events") == upload-quiesce-diagnostics-release-cleanup- ]]
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_prepared_recovery_quiesces_workloads_before_remote_release(
+    tmp_path: Path,
+) -> None:
+    """A pre-handoff Job cannot race removal of its PVC control tree."""
+    result = _bash(_identity(tmp_path / "state") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \
+          DaemonSet workers test-ns workers-uid 0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_remote_reservation "$root" "$fd" 1234abcd \
+          0123456789abcdef0123456789abcdef
+        events={str(tmp_path / 'events')!r}
+        kubectl_delete_owned_object() {{ printf '%s-' "$2" >> "$events"; }}
+        _kubectl_create_inspector() {{
+          printf helper- >> "$events"
+          printf -v "$1" helper
+          printf -v "$2" helper-uid
+        }}
+        kubectl_release_journaled_remote_attempt() {{ printf release- >> "$events"; }}
+        _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup- >> "$events"; }}
+        kubectl_attempt_restore_predecessor() {{ :; }}
+        kubectl_recover_prepared_attempt "$root" "$fd" 1234abcd
+        [[ $(cat "$events") == sweep-workers-helper-release-remove-cleanup- ]]
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_prepared_recovery_retains_remote_state_until_job_is_quiescent(
+    tmp_path: Path,
+) -> None:
+    """A failed exact Job delete leaves the PVC run and lock recoverable."""
+    result = _bash(_identity(tmp_path / "state") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_remote_reservation "$root" "$fd" 1234abcd \
+          0123456789abcdef0123456789abcdef
+        events={str(tmp_path / 'events')!r}
+        kubectl_delete_owned_object() {{ printf delete- >> "$events"; return 1; }}
+        kubectl_release_journaled_remote_attempt() {{ printf release- >> "$events"; }}
+        kubectl_cleanup_journaled_resources() {{ printf cleanup- >> "$events"; }}
+        ! kubectl_recover_prepared_attempt "$root" "$fd" 1234abcd
+        [[ $(cat "$events") == delete-cleanup- ]]
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_clean_failed_resume_restores_collected_predecessor_pointer(
     tmp_path: Path,
 ) -> None:
@@ -1558,6 +1760,17 @@ def test_creation_intent_cleans_object_left_before_resource_journal(
     assert result.returncode == 0, result.stderr
 
 
+def test_repeated_owned_delete_treats_proven_absence_quietly() -> None:
+    """Idempotent cleanup does not misreport an absent object as UID drift."""
+    result = _bash("""
+        kubectl_run_bounded() { :; }
+        kubectl_delete_owned_object Job sweep test-ns \
+            0123456789abcdef0123456789abcdef 1234abcd job-uid
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+
+
 def test_creation_intent_rechecks_absence_after_create_deadline(tmp_path: Path) -> None:
     """A delayed accepted create remains discoverable before intent removal."""
     calls = tmp_path / "calls"
@@ -1581,6 +1794,30 @@ def test_creation_intent_rechecks_absence_after_create_deadline(tmp_path: Path) 
         kubectl_local_lock_release "$fd"
         """)
     assert result.returncode == 0, result.stderr
+
+
+def test_creation_absence_retains_possible_late_object_identity(
+    tmp_path: Path,
+) -> None:
+    """Rollback keeps diagnostic identity after its bounded absence proof."""
+    state = tmp_path / "state"
+    result = _bash(_identity(state) + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd transfer \
+          Pod helper test-ns 0123456789abcdef0123456789abcdef
+        kubectl_run_bounded() { :; }
+        sleep() { :; }
+        stat() { printf '1\n'; }
+        date() { printf '1000\n'; }
+        kubectl_cleanup_creation_intent "$root" "$fd" 1234abcd transfer
+        tombstone="$root/attempts/1234abcd/ambiguous-absence/transfer.sh"
+        [[ -f "$tombstone" && ! -L "$tombstone" ]]
+        grep -F 'KUBECTL_INTENT_NAME=helper' "$tombstone"
+        [[ ! -e "$root/attempts/1234abcd/creation-intents/transfer.sh" ]]
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=OWNERSHIP_AMBIGUOUS" in result.stderr
 
 
 def test_ephemeral_cleanup_reconciles_intent_only_helpers(tmp_path: Path) -> None:
@@ -1770,3 +2007,92 @@ def test_prepared_attempt_recovery_releases_intended_reservation(
         [[ $(cat "$events") == create-release-remove-cleanup- ]]
         """)
     assert result.returncode == 0, result.stderr
+
+
+def test_public_status_recovers_coordinator_loss_before_running(
+    tmp_path: Path,
+) -> None:
+    """A failed exact Job makes a PREPARED PVC ledger collectible."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    calls = tmp_path / "status-calls"
+    events = tmp_path / "events"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
+export KUBECTL_NAMESPACE=test-ns
+export KUBECTL_PVC=test-pvc
+EOF
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_local_lock_release "$fd"
+        calls={str(calls)!r}
+        events={str(events)!r}
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
+        kubectl_read_remote_status() {{
+            printf x >> "$calls"
+            [[ $(wc -c < "$calls") -eq 1 ]] && printf PREPARED || printf FAILED
+        }}
+        kubectl_job_terminal_state() {{ printf -v "$1" FAILED; }}
+        _kubectl_verify_saved_worker_endpoints() {{ :; }}
+        kubectl_preserve_storage_failure_diagnostics() {{ printf diagnose- >> "$events"; }}
+        kubectl_recover_lost_coordinator() {{ printf recover- >> "$events"; }}
+        _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
+        kubectl_emit_state() {{ printf 'STATE=%s\n' "$1"; }}
+        kubectl_lifecycle_operation status {str(results)!r}
+        [[ $(cat "$events") == diagnose-recover-remove- ]]
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STATE=FAILED" in result.stdout
+
+
+def test_completed_job_with_nonterminal_ledger_is_diagnosed(
+    tmp_path: Path,
+) -> None:
+    """Contradictory Job and PVC evidence never degrades to a generic error."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
+export KUBECTL_NAMESPACE=test-ns
+EOF
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
+        kubectl_read_remote_status() {{ printf RUNNING; }}
+        kubectl_job_terminal_state() {{ printf -v "$1" COMPLETE; }}
+        _kubectl_verify_saved_worker_endpoints() {{ :; }}
+        _kubectl_remove_inspector() {{ :; }}
+        ! kubectl_lifecycle_operation status {str(results)!r}
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
+
+
+def test_missing_worker_daemonset_emits_identity_diagnostics(tmp_path: Path) -> None:
+    """External worker deletion fails closed with an actionable diagnosis."""
+    state = tmp_path / "results" / "kubernetes"
+    result = _bash(_identity(state) + """
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \
+          DaemonSet sst-elb-1234abcd-workers test-ns worker-uid \
+          0123456789abcdef0123456789abcdef
+        kubectl_verify_object_identity() { return 1; }
+        kubectl_capture_resource_diagnostics() { printf /tmp/worker-identity; }
+        ! _kubectl_verify_saved_worker_endpoints "$root" 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=DaemonSet" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=worker-uid" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PATH=/tmp/worker-identity" in result.stderr
