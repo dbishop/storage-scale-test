@@ -425,7 +425,11 @@ failure; it does not claim an API outage. Collection retries positively
 identified transient transport failures or tar's isolated changed-source
 warning up to three times with backoff,
 within one transfer deadline (plus the timeout tool's five-second kill
-grace). Authentication, identity, path, local-storage, archive-integrity,
+grace). `KUBECTL_COLLECTION_TIMEOUT_SECONDS` defaults to 7200; each transfer
+defaults to one third of that budget so a hung first producer leaves retry time.
+`KUBECTL_COLLECTION_ATTEMPT_TIMEOUT_SECONDS` can select a larger cap for slow
+archives, still bounded by the remaining total deadline. Authentication,
+identity, path, local-storage, archive-integrity,
 and unknown failures remain fatal. Each failed transfer preserves bounded
 stderr and producer/consumer status in local attempt diagnostics, including
 when a later transfer succeeds; partial archives are discarded between tries.
@@ -433,6 +437,16 @@ Only the published `state/` subtree is transferred; uploaded control files
 remain available locally. Changed-source warnings are never ignored: a retry
 must finish cleanly and pass the same manifest hashes before publication.
 Persistent changes and other tar errors remain fatal with remote data retained.
+
+Control upload uses a verified private archive/tree and publishes only a
+complete bundle. Transient transport failures retry up to three times; a lost
+acknowledgement is reconciled against byte-identical published files instead of
+overwriting controls. `KUBECTL_CONTROL_UPLOAD_TIMEOUT_SECONDS` defaults to 120
+per attempt, with a bounded Pod-resident command and five seconds of local
+deadline headroom. Auth, checksum, and unexpected remote errors do not retry.
+Worker health hooks probe the same selected endpoint up to three times with
+one-second backoff. Persistent failures still fail the current cell; measured
+benchmark phases are never transparently replayed.
 
 For required-recovery faults, capture bounded Job, Pod, and DaemonSet
 descriptions; relevant container logs and namespace events; durable PVC state;

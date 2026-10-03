@@ -60,6 +60,41 @@ CSI provisioning themselves are infrastructure details outside this
 repository's test scope; the backend difference is environmental fidelity, not
 repository feature coverage.
 
+### NFS headroom and kernel isolation
+
+The NFS fixture requests a floor of 32 workers without reducing an existing
+larger pool or restarting the server. `INTEGRATION_NFS_THREADS` selects a floor
+from 1 to 256. Inspection, tuning, and worker restoration failures are logged
+without failing the lifecycle. The original count is recorded before tuning
+and restored at teardown; tuning is skipped when a pre-existing count cannot
+be recorded safely. This applies to privileged OmniStation and NVIDIA runners.
+Docker SBX's `sbx-shared` profile has no owned NFS server, logs that tuning is
+skipped, and never reaches through Docker to modify another agent's host.
+Actual storage or test failures remain fatal.
+
+Containers share their host kernel. The single-host, loop-backed ext4 NFS
+fixture can encounter a reclaim dependency in which server writes wait for NFS
+commits needing the same worker pool. At the first command timeout, the driver
+captures bounded host-local pressure, NFS counters/queues, blocked-task stacks,
+and kernel warnings before cleanup accesses the PVC. If NFS server workers are
+blocked, recovery best-effort doubles their pool up to 256, retaining any larger
+pool and the original restoration count. Extra workers are a mitigation, not
+kernel isolation.
+
+True NFS kernel isolation needs a separate server VM or host and an externally
+provisioned storage fixture. A second container would not provide that
+isolation; this harness does not assume nested virtualization on OmniStation,
+SBX, or GitHub runners. Keep realistic sync exports and hard mounts. Local NFS
+hosts should verify the upstream `nfs_release_folio()` reclaim fix
+(`cce0be6eb4971456b703aaeafd571650d314bcca`) in their kernel. The harness does
+not upgrade or reboot a shared host.
+
+Failure-injection uploads use finite stdin, verified temporary files, atomic
+binary publication, remote deadlines, and bounded transient retries. Cleanup
+restores from the verified local binary only after wrapper installation was
+attempted, including a lost publication acknowledgement; it never trusts a
+potentially partial remote delegate.
+
 Select Docker SBX explicitly with:
 
 ```bash

@@ -93,7 +93,11 @@ corruption, and unknown failures remain fatal.
 Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
 use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
 only owned resources, restores prior NFS state, verifies unmounts, and does not
-depend on writable diagnostics.
+depend on writable diagnostics. NFS headroom uses a configurable floor of 32
+workers without lowering existing capacity; tuning and restoration are
+best-effort. First-stall diagnostics capture kernel/NFS evidence locally,
+and blocked server workers trigger a bounded pool increase. Docker SBX avoids
+NFS; true NFS kernel isolation needs a separate server VM or host.
 
 The test CLI selects substrates and scenarios independently. Its planner batches
 shared-home SSH cases behind a crash-recoverable transition; separate homes are
@@ -288,7 +292,12 @@ revalidated by status and collection; the API-independent coordinator probes
 frozen addresses before each cell. Drift or coordinator loss is recovered only
 with fresh identity evidence. Collection copies PVC results to the local result
 tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
-context, and compatible CNI are prerequisites.
+context, and compatible CNI are prerequisites. Control uploads verify private
+staging archives before publishing and retry only transient failures, reconciling
+lost acknowledgements against the existing immutable controls. Coordinator
+health probes retry the same selected address three times without replaying
+measured work. Collection reserves per-transfer recovery time within its total
+deadline; partial archives are discarded and publication hashes remain mandatory.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 
